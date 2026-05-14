@@ -1,0 +1,7 @@
+services:
+  bot:
+    build: .
+    container_name: save-restricted-bot
+    restart: unless-stopped
+    volumes:
+      - ./config.json:/app/config.json:ro
