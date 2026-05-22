@@ -12,7 +12,7 @@ Based on [Save-Restricted-Bot](https://github.com/bipinkrish/Save-Restricted-Bot
 - `ID` Your API ID from my.telegram.org
 - `TOKEN` Your bot token from @BotFather
 - `STRING` Your session string, you can get it at [gist](https://gist.github.com/bipinkrish/0940b30ed66a5537ae1b5aaaee716897#file-main-py) and run it locally
-- `OWNER_ID` Your Telegram user ID
+- `OWNER_ID` Telegram user IDs allowed to use the bot
 
 ---
 
@@ -28,7 +28,10 @@ Set the required values in `config.json` before starting the bot:
     "ID": "your_api_id",
     "HASH": "your_api_hash",
     "STRING": "your_pyrogram_session_string",
-    "OWNER_ID": "your_telegram_user_id"
+    "OWNER_ID": [
+        123456789,
+        987654321
+    ]
 }
 ```
 

@@ -13,7 +13,7 @@ CONFIG_FILE = Path(__file__).with_name('config.json')
 with CONFIG_FILE.open('r') as f: DATA = json.load(f)
 
 
-owner_id = int(DATA.get("OWNER_ID"))
+owner_ids = {int(owner_id) for owner_id in DATA.get("OWNER_ID", [])}
 bot_token = DATA.get("TOKEN")
 api_hash = DATA.get("HASH")
 api_id = DATA.get("ID")
@@ -83,7 +83,7 @@ def progress(current, total, message, type):
 
 
 def is_owner(message):
-    return message.from_user is not None and message.from_user.id == owner_id
+    return message.from_user is not None and message.from_user.id in owner_ids
 
 
 def deny_access(message):
