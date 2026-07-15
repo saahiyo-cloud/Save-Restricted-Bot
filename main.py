@@ -214,6 +214,26 @@ def save(client: pyrogram.client.Client, message: pyrogram.types.messages_and_me
         time.sleep(3)
 
 
+@bot.on_message(filters.incoming & filters.media)
+def save_media(client: pyrogram.client.Client, message: pyrogram.types.messages_and_media.message.Message):
+    if not is_owner(message):
+        deny_access(message)
+        return
+
+    try:
+        if message.media_group_id:
+            # Telegram delivers each album item as a separate update.
+            time.sleep(1)
+            media_group = bot.get_media_group(message.chat.id, message.id)
+            if message.id != media_group[0].id:
+                return
+            bot.copy_media_group(message.chat.id, message.chat.id, message.id, reply_to_message_id=message.id)
+        else:
+            bot.copy_message(message.chat.id, message.chat.id, message.id, reply_to_message_id=message.id)
+    except Exception as e:
+        bot.send_message(message.chat.id, f"**Error** : __{e}__", reply_to_message_id=message.id)
+
+
 def handle_private(message: pyrogram.types.messages_and_media.message.Message, chatid: int, msgid: int, processed_media_groups=None):
     msg: pyrogram.types.messages_and_media.message.Message = acc.get_messages(chatid,msgid)
     media_group_id = getattr(msg, "media_group_id", None)
