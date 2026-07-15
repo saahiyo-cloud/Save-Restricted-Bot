@@ -7,6 +7,7 @@ import re
 import time
 import threading
 import json
+import os
 from pathlib import Path
 
 CONFIG_FILE = Path(__file__).with_name('config.json')
