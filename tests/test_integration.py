@@ -43,11 +43,15 @@ async def test_handle_private_message_happy_path(tmp_path):
 
         await handle_private_message(user_msg, telegram_msg)
 
-        # Status message was created with Cancel button
-        mock_send_msg.assert_called_once()
-        _, kwargs = mock_send_msg.call_args
-        assert kwargs.get("reply_markup") is not None
-        assert "❌ Cancel" in kwargs["reply_markup"].inline_keyboard[0][0].text
+        # Status message was created with Cancel button, followed by completion report
+        assert mock_send_msg.call_count == 2
+        first_args, first_kwargs = mock_send_msg.call_args_list[0]
+        assert first_kwargs.get("reply_markup") is not None
+        assert "❌ Cancel" in first_kwargs["reply_markup"].inline_keyboard[0][0].text
+
+        second_args, second_kwargs = mock_send_msg.call_args_list[1]
+        assert "Download Completed!" in second_kwargs.get("text", "")
+        assert "Download Time:" in second_kwargs.get("text", "")
 
         # Media was downloaded and sent
         mock_dl.assert_called_once()

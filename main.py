@@ -315,8 +315,10 @@ MAX_BOT_FILE_SIZE = 2000 * 1024 * 1024  # 2 GB Telegram Bot API upload limit
 
 THUMB_DIR = Path("downloads/thumbnails")
 CAPTION_DIR = Path("downloads/captions")
+DONE_MSG_DIR = Path("downloads/custom_msgs")
 THUMB_DIR.mkdir(parents=True, exist_ok=True)
 CAPTION_DIR.mkdir(parents=True, exist_ok=True)
+DONE_MSG_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def get_user_thumb(user_id: int) -> Optional[str]:
@@ -382,6 +384,150 @@ def apply_caption_template(user_id: int, original_caption: Optional[str], filena
     return res.strip()
 
 
+def get_user_custom_msg(user_id: int) -> Optional[str]:
+    """Retrieve user's custom completion message note."""
+    msg_path = DONE_MSG_DIR / f"{user_id}.txt"
+    if msg_path.exists():
+        try:
+            return msg_path.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    return None
+
+
+def set_user_custom_msg(user_id: int, message_text: str):
+    """Save custom completion message note for a user."""
+    target = DONE_MSG_DIR / f"{user_id}.txt"
+    target.write_text(message_text, encoding="utf-8")
+
+
+def del_user_custom_msg(user_id: int) -> bool:
+    """Delete custom completion message note for a user."""
+    target = DONE_MSG_DIR / f"{user_id}.txt"
+    if target.exists():
+        try:
+            target.unlink()
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def format_time_duration(seconds: float) -> str:
+    """Format elapsed seconds into readable human string."""
+    if seconds < 1.0:
+        return f"{seconds:.2f}s"
+    elif seconds < 60.0:
+        return f"{seconds:.1f}s"
+    minutes = int(seconds) // 60
+    rem_sec = seconds - (minutes * 60)
+    return f"{minutes}m {rem_sec:.1f}s"
+
+
+def build_completion_message(
+    file_name: str,
+    file_size: int,
+    msg_type: str,
+    download_duration: float,
+    upload_duration: float,
+    bot_username: Optional[str] = None,
+    custom_note: Optional[str] = None,
+) -> str:
+    """Build a detailed completion report card with download and upload statistics."""
+    size_str = format_size(file_size) if file_size > 0 else "Unknown"
+    down_str = format_time_duration(download_duration)
+    up_str = format_time_duration(upload_duration)
+    total_duration = download_duration + upload_duration
+    total_str = format_time_duration(total_duration)
+
+    down_speed_str = ""
+    if download_duration > 0 and file_size > 0:
+        avg_down_speed = file_size / download_duration
+        down_speed_str = f" ({format_speed(avg_down_speed)})"
+
+    up_speed_str = ""
+    if upload_duration > 0 and file_size > 0:
+        avg_up_speed = file_size / upload_duration
+        up_speed_str = f" ({format_speed(avg_up_speed)})"
+
+    via_str = f"\n🤖 **Downloaded via:** @{bot_username}" if bot_username else ""
+    note_str = f"\n\n💬 **Note:** {custom_note}" if custom_note else ""
+
+    return (
+        "✅ **Download Completed!**\n\n"
+        f"📄 **File:** `{file_name}`\n"
+        f"📦 **Size:** `{size_str}`\n"
+        f"📁 **Type:** `{msg_type}`\n\n"
+        f"⏱ **Download Time:** `{down_str}`{down_speed_str}\n"
+        f"🚀 **Upload Time:** `{up_str}`{up_speed_str}\n"
+        f"⏳ **Total Time:** `{total_str}`"
+        f"{note_str}"
+        f"{via_str}"
+    )
+
+
+async def send_completion_report(
+    chat_id: int,
+    file_name: str,
+    file_size: int,
+    msg_type: str,
+    download_duration: float,
+    upload_duration: float,
+    thumb_path: Optional[str] = None,
+    user_id: Optional[int] = None,
+    reply_to_message_id: Optional[int] = None,
+):
+    """Send a separate message detailing file transfer statistics, showing thumbnail preview if available."""
+    bot_username = getattr(getattr(bot, "me", None), "username", None)
+    custom_note = get_user_custom_msg(user_id) if user_id else None
+    text = build_completion_message(
+        file_name=file_name,
+        file_size=file_size,
+        msg_type=msg_type,
+        download_duration=download_duration,
+        upload_duration=upload_duration,
+        bot_username=bot_username,
+        custom_note=custom_note,
+    )
+
+    # If a valid image thumbnail file exists on disk, send as photo with the caption to show thumbnail
+    if thumb_path and os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+        try:
+            await bot.send_photo(
+                chat_id=chat_id,
+                photo=thumb_path,
+                caption=text,
+                reply_to_message_id=reply_to_message_id,
+            )
+            return
+        except Exception:
+            try:
+                await bot.send_photo(
+                    chat_id=chat_id,
+                    photo=thumb_path,
+                    caption=text,
+                )
+                return
+            except Exception as e:
+                logger.debug(f"Could not send thumbnail report as photo: {e}")
+
+    # Fallback to rich markdown text message
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            reply_to_message_id=reply_to_message_id,
+        )
+    except Exception:
+        try:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+            )
+        except Exception as e:
+            logger.warning(f"Could not send completion report: {e}")
+
+
 def check_file_size_limit(msg: Message) -> Tuple[bool, int]:
     """Check if media in message exceeds Telegram's 2 GB bot upload limit."""
     media_obj = getattr(msg, "document", None) or getattr(msg, "video", None) or getattr(msg, "audio", None)
@@ -401,17 +547,42 @@ def generate_video_thumbnail(video_path: str) -> Optional[str]:
     thumb_path = video_path + "_thumb.jpg"
     try:
         import subprocess
+        for ss in ["00:00:01", "00:00:00"]:
+            cmd = [
+                ffmpeg_bin,
+                "-ss", ss,
+                "-i", video_path,
+                "-vframes", "1",
+                "-q:v", "2",
+                "-y",
+                thumb_path,
+            ]
+            res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            if res.returncode == 0 and os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+                return thumb_path
+    except Exception:
+        pass
+    return None
+
+
+def extract_audio_thumbnail(audio_path: str) -> Optional[str]:
+    """Extract embedded album artwork from audio file using ffmpeg if available."""
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin or not os.path.exists(audio_path):
+        return None
+    thumb_path = audio_path + "_thumb.jpg"
+    try:
+        import subprocess
         cmd = [
             ffmpeg_bin,
-            "-ss", "00:00:01",
-            "-i", video_path,
-            "-vframes", "1",
-            "-q:v", "2",
+            "-i", audio_path,
+            "-an",
+            "-vcodec", "copy",
             "-y",
             thumb_path,
         ]
-        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
-        if res.returncode == 0 and os.path.exists(thumb_path):
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+        if res.returncode == 0 and os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
             return thumb_path
     except Exception:
         pass
@@ -964,6 +1135,60 @@ async def showcaption_handler(client: Client, message: Message):
         await bot.send_message(message.chat.id, "ℹ️ **No custom caption template set. Using original captions.**", reply_to_message_id=message.id)
 
 
+@bot.on_message(filters.command(["setmsg", "setdone"]))
+async def setmsg_handler(client: Client, message: Message):
+    if not is_owner(message):
+        await deny_access(message)
+        return
+    parts = message.text.split(None, 1)
+    if len(parts) < 2:
+        await bot.send_message(
+            message.chat.id,
+            "⚠️ **Usage:** `/setmsg <text>`\n\n"
+            "Set a custom note to include in the download completion card.\n\n"
+            "Example:\n`/setmsg Thank you for downloading! Join @mychannel`",
+            reply_to_message_id=message.id,
+        )
+        return
+    custom_text = parts[1].strip()
+    user_id = message.from_user.id if message.from_user else 0
+    set_user_custom_msg(user_id, custom_text)
+    await bot.send_message(
+        message.chat.id,
+        "✅ **Custom completion message saved!** It will appear on your download summary cards.",
+        reply_to_message_id=message.id,
+    )
+
+
+@bot.on_message(filters.command(["delmsg", "deldone"]))
+async def delmsg_handler(client: Client, message: Message):
+    if not is_owner(message):
+        await deny_access(message)
+        return
+    user_id = message.from_user.id if message.from_user else 0
+    if del_user_custom_msg(user_id):
+        await bot.send_message(message.chat.id, "🗑️ **Custom completion message deleted.**", reply_to_message_id=message.id)
+    else:
+        await bot.send_message(message.chat.id, "ℹ️ **No custom completion message was found.**", reply_to_message_id=message.id)
+
+
+@bot.on_message(filters.command(["showmsg", "viewmsg", "showdone"]))
+async def showmsg_handler(client: Client, message: Message):
+    if not is_owner(message):
+        await deny_access(message)
+        return
+    user_id = message.from_user.id if message.from_user else 0
+    custom_text = get_user_custom_msg(user_id)
+    if custom_text:
+        await bot.send_message(
+            message.chat.id,
+            f"📝 **Your Active Completion Message Note:**\n\n`{custom_text}`",
+            reply_to_message_id=message.id,
+        )
+    else:
+        await bot.send_message(message.chat.id, "ℹ️ **No custom completion message note set.**", reply_to_message_id=message.id)
+
+
 async def send_with_user_session(message: Message, chatid: Union[int, str], msgid: int, processed_media_groups: set):
     if acc is None:
         await bot.send_message(message.chat.id, f"**String Session is not Set**", reply_to_message_id=message.id)
@@ -1253,13 +1478,21 @@ async def handle_private_message(message: Message, msg: Message):
     up_task = None
     file = None
     thumb = None
+    sent_media = None
+    file_display_name = "File"
+    smsg_deleted = False
 
     try:
+        download_start = time.time()
         # download_media runs with max_concurrent_transmissions=10 connections
         file = await acc.download_media(msg, progress=progress, progress_args=[smsg, "down", task_id])
+        download_duration = max(time.time() - download_start, 0.01)
+
         if task_ctx.is_cancelled or file is None:
             return
         task_ctx.track_file(file)
+
+        file_size = os.path.getsize(file) if os.path.exists(file) else 0
 
         STATUS_TRACKER.pop(down_key, None)
         if down_task and not down_task.done():
@@ -1271,8 +1504,10 @@ async def handle_private_message(message: Message, msg: Message):
         await bot.edit_message_text(message.chat.id, smsg.id, "__Uploading__", reply_markup=cancel_markup)
         up_task = asyncio.create_task(upstatus(up_key, smsg, task_id))
 
+        upload_start = time.time()
         if "Document" == msg_type:
             doc_name = getattr(msg.document, "file_name", None) or os.path.basename(file)
+            file_display_name = doc_name
             caption = apply_caption_template(user_id, msg.caption, doc_name)
             thumb = custom_thumb
             if not thumb:
@@ -1282,10 +1517,17 @@ async def handle_private_message(message: Message, msg: Message):
                         task_ctx.track_file(thumb)
                 except Exception:
                     thumb = None
+            if not thumb and file:
+                file_lower = file.lower()
+                if any(file_lower.endswith(ext) for ext in [".mp4", ".mkv", ".mov", ".avi", ".flv", ".webm", ".ts", ".m4v"]):
+                    generated_thumb = generate_video_thumbnail(file)
+                    if generated_thumb:
+                        thumb = generated_thumb
+                        task_ctx.track_file(thumb)
 
             if task_ctx.is_cancelled:
                 return
-            await bot.send_document(
+            sent_media = await bot.send_document(
                 message.chat.id,
                 file,
                 thumb=thumb,
@@ -1298,6 +1540,7 @@ async def handle_private_message(message: Message, msg: Message):
 
         elif "Video" == msg_type:
             vid_name = getattr(msg.video, "file_name", None) or os.path.basename(file)
+            file_display_name = vid_name
             caption = apply_caption_template(user_id, msg.caption, vid_name)
             thumb = custom_thumb
             if not thumb:
@@ -1315,7 +1558,7 @@ async def handle_private_message(message: Message, msg: Message):
 
             if task_ctx.is_cancelled:
                 return
-            await bot.send_video(
+            sent_media = await bot.send_video(
                 message.chat.id,
                 file,
                 duration=msg.video.duration or 0,
@@ -1330,20 +1573,23 @@ async def handle_private_message(message: Message, msg: Message):
             )
 
         elif "Animation" == msg_type:
+            file_display_name = getattr(msg.animation, "file_name", None) or os.path.basename(file)
             if task_ctx.is_cancelled:
                 return
-            await bot.send_animation(message.chat.id, file, reply_to_message_id=message.id)
+            sent_media = await bot.send_animation(message.chat.id, file, reply_to_message_id=message.id)
 
         elif "Sticker" == msg_type:
+            file_display_name = getattr(msg.sticker, "set_name", None) or "Sticker"
             if task_ctx.is_cancelled:
                 return
-            await bot.send_sticker(message.chat.id, file, reply_to_message_id=message.id)
+            sent_media = await bot.send_sticker(message.chat.id, file, reply_to_message_id=message.id)
 
         elif "Voice" == msg_type:
+            file_display_name = "Voice Message"
             caption = apply_caption_template(user_id, msg.caption)
             if task_ctx.is_cancelled:
                 return
-            await bot.send_voice(
+            sent_media = await bot.send_voice(
                 message.chat.id,
                 file,
                 caption=caption,
@@ -1354,7 +1600,8 @@ async def handle_private_message(message: Message, msg: Message):
             )
 
         elif "Audio" == msg_type:
-            audio_name = getattr(msg.audio, "file_name", None) or os.path.basename(file)
+            audio_name = getattr(msg.audio, "file_name", None) or getattr(msg.audio, "title", None) or os.path.basename(file)
+            file_display_name = audio_name
             caption = apply_caption_template(user_id, msg.caption, audio_name)
             thumb = custom_thumb
             if not thumb:
@@ -1364,10 +1611,15 @@ async def handle_private_message(message: Message, msg: Message):
                         task_ctx.track_file(thumb)
                 except Exception:
                     thumb = None
+            if not thumb and file:
+                audio_thumb = extract_audio_thumbnail(file)
+                if audio_thumb:
+                    thumb = audio_thumb
+                    task_ctx.track_file(thumb)
 
             if task_ctx.is_cancelled:
                 return
-            await bot.send_audio(
+            sent_media = await bot.send_audio(
                 message.chat.id,
                 file,
                 caption=caption,
@@ -1378,15 +1630,45 @@ async def handle_private_message(message: Message, msg: Message):
             )
 
         elif "Photo" == msg_type:
+            file_display_name = "Photo"
             if task_ctx.is_cancelled:
                 return
-            await bot.send_photo(
+            sent_media = await bot.send_photo(
                 message.chat.id,
                 file,
                 caption=msg.caption,
                 caption_entities=msg.caption_entities,
                 reply_to_message_id=message.id,
             )
+
+        upload_duration = max(time.time() - upload_start, 0.01)
+
+        # Stop upstatus updater before sending completion report
+        STATUS_TRACKER.pop(up_key, None)
+        if up_task and not up_task.done():
+            up_task.cancel()
+
+        # Delete status message
+        await delete_status_message(message, smsg)
+        smsg_deleted = True
+
+        # Send separate completion message showing thumbnail preview and time taken
+        report_thumb = thumb
+        if not report_thumb and msg_type == "Photo" and file and os.path.exists(file):
+            report_thumb = file
+
+        report_reply_id = sent_media.id if sent_media else message.id
+        await send_completion_report(
+            chat_id=message.chat.id,
+            file_name=file_display_name,
+            file_size=file_size,
+            msg_type=msg_type,
+            download_duration=download_duration,
+            upload_duration=upload_duration,
+            thumb_path=report_thumb,
+            user_id=user_id,
+            reply_to_message_id=report_reply_id,
+        )
 
     except (asyncio.CancelledError, pyrogram.StopTransmission):
         logger.info(f"Task {task_id} was cancelled cleanly.")
@@ -1399,20 +1681,22 @@ async def handle_private_message(message: Message, msg: Message):
         if up_task and not up_task.done():
             up_task.cancel()
         task_ctx.cleanup_files()
-        remove_file(thumb)
+        if thumb and thumb != custom_thumb:
+            remove_file(thumb)
         remove_file(file)
         unregister_task(task_id)
         if task_ctx.is_cancelled:
             asyncio.create_task(delayed_delete_status(message.chat.id, smsg.id, delay=2.0))
-        else:
+        elif not smsg_deleted:
             await delete_status_message(message, smsg)
 
 
 async def handle_private_media_group(message: Message, messages: List[Message]):
     task_id = uuid.uuid4().hex[:10]
+    user_id = message.from_user.id if message.from_user else 0
     task_ctx = TaskContext(
         task_id=task_id,
-        initiator_id=message.from_user.id if message.from_user else 0,
+        initiator_id=user_id,
         chat_id=message.chat.id,
     )
     task_ctx.async_task = asyncio.current_task()
@@ -1434,8 +1718,10 @@ async def handle_private_media_group(message: Message, messages: List[Message]):
     files = []
     thumbs = []
     media = []
+    smsg_deleted = False
 
     try:
+        download_start = time.time()
         for msg in messages:
             if task_ctx.is_cancelled:
                 return
@@ -1450,7 +1736,6 @@ async def handle_private_media_group(message: Message, messages: List[Message]):
             files.append(file)
             task_ctx.track_file(file)
 
-            user_id = message.from_user.id if message.from_user else 0
             raw_caption = msg.caption or ""
             caption = apply_caption_template(user_id, raw_caption) or ""
             caption_entities = msg.caption_entities if caption == raw_caption else None
@@ -1465,6 +1750,11 @@ async def handle_private_media_group(message: Message, messages: List[Message]):
                         task_ctx.track_file(thumb)
                 except Exception:
                     thumb = None
+                if not thumb and file:
+                    generated_thumb = generate_video_thumbnail(file)
+                    if generated_thumb:
+                        thumb = generated_thumb
+                        task_ctx.track_file(thumb)
                 if thumb:
                     thumbs.append(thumb)
                 media.append(InputMediaVideo(
@@ -1484,6 +1774,13 @@ async def handle_private_media_group(message: Message, messages: List[Message]):
                         task_ctx.track_file(thumb)
                 except Exception:
                     thumb = None
+                if not thumb and file:
+                    file_lower = file.lower()
+                    if any(file_lower.endswith(ext) for ext in [".mp4", ".mkv", ".mov", ".avi", ".flv", ".webm", ".ts", ".m4v"]):
+                        generated_thumb = generate_video_thumbnail(file)
+                        if generated_thumb:
+                            thumb = generated_thumb
+                            task_ctx.track_file(thumb)
                 if thumb:
                     thumbs.append(thumb)
                 media.append(InputMediaDocument(file, thumb=thumb, caption=caption, caption_entities=caption_entities))
@@ -1495,6 +1792,11 @@ async def handle_private_media_group(message: Message, messages: List[Message]):
                         task_ctx.track_file(thumb)
                 except Exception:
                     thumb = None
+                if not thumb and file:
+                    audio_thumb = extract_audio_thumbnail(file)
+                    if audio_thumb:
+                        thumb = audio_thumb
+                        task_ctx.track_file(thumb)
                 if thumb:
                     thumbs.append(thumb)
                 media.append(InputMediaAudio(
@@ -1507,6 +1809,8 @@ async def handle_private_media_group(message: Message, messages: List[Message]):
                     title=msg.audio.title or "",
                 ))
 
+        download_duration = max(time.time() - download_start, 0.01)
+
         STATUS_TRACKER.pop(down_key, None)
         if down_task and not down_task.done():
             down_task.cancel()
@@ -1516,12 +1820,39 @@ async def handle_private_media_group(message: Message, messages: List[Message]):
 
         await bot.edit_message_text(message.chat.id, smsg.id, "__Uploading__", reply_markup=cancel_markup)
 
+        upload_start = time.time()
         # Send media in chunks of MAX_MEDIA_GROUP_SIZE to respect Telegram's 10-item limit
         for i in range(0, len(media), MAX_MEDIA_GROUP_SIZE):
             if task_ctx.is_cancelled:
                 return
             chunk = media[i:i + MAX_MEDIA_GROUP_SIZE]
             await bot.send_media_group(message.chat.id, chunk, reply_to_message_id=message.id)
+        upload_duration = max(time.time() - upload_start, 0.01)
+
+        # Delete status message
+        await delete_status_message(message, smsg)
+        smsg_deleted = True
+
+        # Send separate completion message for media group
+        total_size = sum(os.path.getsize(f) for f in files if os.path.exists(f))
+        report_thumb = thumbs[0] if (thumbs and os.path.exists(thumbs[0])) else None
+        if not report_thumb:
+            for f in files:
+                if f.lower().endswith(('.jpg', '.jpeg', '.png')) and os.path.exists(f):
+                    report_thumb = f
+                    break
+
+        await send_completion_report(
+            chat_id=message.chat.id,
+            file_name=f"Media Album ({len(files)} items)",
+            file_size=total_size,
+            msg_type="Media Group",
+            download_duration=download_duration,
+            upload_duration=upload_duration,
+            thumb_path=report_thumb,
+            user_id=user_id,
+            reply_to_message_id=message.id,
+        )
 
     except (asyncio.CancelledError, pyrogram.StopTransmission):
         logger.info(f"Media group task {task_id} was cancelled cleanly.")
@@ -1538,7 +1869,7 @@ async def handle_private_media_group(message: Message, messages: List[Message]):
         unregister_task(task_id)
         if task_ctx.is_cancelled:
             asyncio.create_task(delayed_delete_status(message.chat.id, smsg.id, delay=2.0))
-        else:
+        elif not smsg_deleted:
             await delete_status_message(message, smsg)
 
 
@@ -1622,13 +1953,16 @@ https://t.me/c/123456789/101-120
 
 The bot processes up to 100 messages per request. Albums / media groups are sent as a group when possible.
 
-**Custom Thumbnails & Captions**
+**Custom Thumbnails, Captions & Completion Messages**
 - `/setthumb`: Reply to any image to set as your default thumbnail
 - `/delthumb`: Delete your custom thumbnail
 - `/showthumb`: View your current active thumbnail
 - `/setcaption <template>`: Set custom caption with `{caption}` and `{filename}`
 - `/delcaption`: Remove custom caption template
 - `/showcaption`: View active caption template
+- `/setmsg <text>`: Add a custom note/branding to download completion cards
+- `/delmsg`: Remove custom note from completion cards
+- `/showmsg`: View active completion note
 
 **Diagnostics & Info**
 - `/ping`: Check bot response latency
