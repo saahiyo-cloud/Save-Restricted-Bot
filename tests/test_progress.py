@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 from main import (
     make_progress_bar,
@@ -121,3 +122,52 @@ def test_render_progress_text():
 def test_edit_throttle_range():
     # Verify throttle interval is fast, responsive, and within safe Telegram rate-limiting guidelines (1.0s to 3.0s)
     assert 1.0 <= EDIT_THROTTLE_SECONDS <= 3.0
+
+
+def test_init_status_tracker():
+    from main import init_status_tracker, STATUS_TRACKER
+    key = init_status_tracker(
+        chat_id=12345,
+        message_id=6789,
+        type_str="down",
+        total=20000000,
+        task_id="test_task_1",
+        file_name="video.mp4",
+        media_type="Video",
+    )
+    assert key == (12345, 6789, "down")
+    assert key in STATUS_TRACKER
+    entry = STATUS_TRACKER[key]
+    assert entry["total"] == 20000000
+    assert entry["file_name"] == "video.mp4"
+    assert entry["media_type"] == "Video"
+    assert entry["current"] == 0
+    assert entry["speed"] == 0.0
+    STATUS_TRACKER.pop(key, None)
+
+
+@pytest.mark.asyncio
+async def test_status_updater_edits_photo_caption():
+    from unittest.mock import AsyncMock, MagicMock, patch
+    from main import status_updater, init_status_tracker, STATUS_TRACKER
+
+    key = (111, 222, "down")
+    init_status_tracker(111, 222, "down", total=1000, file_name="clip.mp4", media_type="Video")
+
+    mock_msg = MagicMock()
+    mock_msg.chat.id = 111
+    mock_msg.id = 222
+    mock_msg.photo = MagicMock()  # Simulates photo message with caption
+
+    with patch("main.bot.edit_message_caption", new_callable=AsyncMock) as mock_edit_caption, \
+         patch("main.bot.edit_message_text", new_callable=AsyncMock) as mock_edit_text, \
+         patch("main.EDIT_THROTTLE_SECONDS", 0.01):
+        
+        task = asyncio.create_task(status_updater(key, mock_msg, "Downloading", task_id="t_photo"))
+        await asyncio.sleep(0.05)
+        STATUS_TRACKER.pop(key, None)
+        await task
+
+        mock_edit_caption.assert_called()
+        mock_edit_text.assert_not_called()
+

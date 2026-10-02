@@ -232,6 +232,8 @@ ss = CONFIG["STRING"]
 FLOODWAIT_METHODS = [
     "send_message",
     "edit_message_text",
+    "edit_message_caption",
+    "edit_message_media",
     "delete_messages",
     "copy_message",
     "copy_media_group",
@@ -901,6 +903,34 @@ async def delayed_delete_status(chat_id: int, smsg_id: int, delay: float = 2.0):
         pass
 
 
+def init_status_tracker(
+    chat_id: int,
+    message_id: int,
+    type_str: str,
+    total: int = 0,
+    task_id: Optional[str] = None,
+    file_name: Optional[str] = None,
+    media_type: Optional[str] = None,
+) -> Tuple[int, int, str]:
+    """Initialize a status tracker entry immediately so timers and progress start counting without delay."""
+    key = (chat_id, message_id, type_str)
+    now = time.time()
+    STATUS_TRACKER[key] = {
+        "start_time": now,
+        "last_time": now,
+        "last_current": 0,
+        "current": 0,
+        "total": max(int(total or 0), 0),
+        "speed": 0.0,
+        "eta": 0.0,
+        "task_id": task_id,
+        "type": type_str,
+        "file_name": file_name,
+        "media_type": media_type,
+    }
+    return key
+
+
 async def status_updater(
     key: Tuple[int, int, str],
     message: Message,
@@ -912,29 +942,58 @@ async def status_updater(
     """Periodically update Telegram status message with fast responsive progress edits (1.5-2.0s)."""
     cancel_markup = get_cancel_button(task_id) if task_id else None
     last_rendered_text = ""
-    try:
-        # Immediate fast check: wait briefly for initial packet to appear
-        for _ in range(4):
-            if key in STATUS_TRACKER:
-                break
-            await asyncio.sleep(0.1)
 
+    # Ensure key exists in tracker so loop never exits prematurely while connection handshake takes place
+    if key not in STATUS_TRACKER:
+        init_status_tracker(
+            chat_id=message.chat.id,
+            message_id=message.id,
+            type_str=key[2] if len(key) > 2 else "down",
+            total=0,
+            task_id=task_id,
+            file_name=file_name,
+            media_type=media_type,
+        )
+
+    try:
         while key in STATUS_TRACKER:
+            if task_id and is_task_cancelled(task_id):
+                break
             data = STATUS_TRACKER.get(key)
-            if data:
-                now = time.time()
-                elapsed = max(0.0, now - data.get("start_time", now))
-                text = render_progress_text(
-                    action=action_title,
-                    current=data.get("current", 0),
-                    total=data.get("total", 0),
-                    speed=data.get("speed", 0.0),
-                    eta=data.get("eta", 0.0),
-                    elapsed=elapsed,
-                    file_name=file_name or data.get("file_name"),
-                    media_type=media_type or data.get("media_type"),
-                )
-                if text != last_rendered_text:
+            if not data:
+                break
+
+            now = time.time()
+            elapsed = max(0.0, now - data.get("start_time", now))
+            text = render_progress_text(
+                action=action_title,
+                current=data.get("current", 0),
+                total=data.get("total", 0),
+                speed=data.get("speed", 0.0),
+                eta=data.get("eta", 0.0),
+                elapsed=elapsed,
+                file_name=file_name or data.get("file_name"),
+                media_type=media_type or data.get("media_type"),
+            )
+
+            if text != last_rendered_text:
+                is_photo_msg = bool(getattr(message, "photo", None))
+                if is_photo_msg:
+                    try:
+                        await bot.edit_message_caption(
+                            message.chat.id,
+                            message.id,
+                            caption=text,
+                            reply_markup=cancel_markup,
+                        )
+                        last_rendered_text = text
+                    except MessageNotModified:
+                        pass
+                    except MessageIdInvalid:
+                        break
+                    except Exception as e:
+                        logger.debug(f"edit_message_caption failed: {e}")
+                else:
                     try:
                         await bot.edit_message_text(
                             message.chat.id,
@@ -960,8 +1019,9 @@ async def status_updater(
                             pass
                         except MessageIdInvalid:
                             break
-                        except Exception:
-                            pass
+                        except Exception as e:
+                            logger.debug(f"edit_message_caption fallback failed: {e}")
+
             await asyncio.sleep(EDIT_THROTTLE_SECONDS)
     except asyncio.CancelledError:
         return
@@ -1672,6 +1732,7 @@ async def handle_private_message(message: Message, msg: Message):
     down_key = (smsg.chat.id, smsg.id, "down")
     up_key = (smsg.chat.id, smsg.id, "up")
 
+    init_status_tracker(smsg.chat.id, smsg.id, "down", total=init_size, task_id=task_id, file_name=init_name, media_type=init_type)
     down_task = asyncio.create_task(downstatus(down_key, smsg, task_id, init_name, init_type))
     up_task = None
     file = None
@@ -1690,8 +1751,17 @@ async def handle_private_message(message: Message, msg: Message):
         )
         download_duration = max(time.time() - download_start, 0.01)
 
-        if task_ctx.is_cancelled or file is None:
+        if task_ctx.is_cancelled:
             return
+
+        if file is None:
+            await bot.send_message(
+                message.chat.id,
+                "❌ **Download Failed:** Could not download media from Telegram.",
+                reply_to_message_id=message.id,
+            )
+            return
+
         task_ctx.track_file(file)
 
         file_size = os.path.getsize(file) if os.path.exists(file) else init_size
@@ -1713,13 +1783,21 @@ async def handle_private_message(message: Message, msg: Message):
             file_name=file_display_name,
             media_type=msg_type,
         )
-        try:
-            await bot.edit_message_text(message.chat.id, smsg.id, initial_up_text, reply_markup=cancel_markup)
-        except Exception:
+        is_photo_status = bool(getattr(smsg, "photo", None))
+        if is_photo_status:
             try:
                 await bot.edit_message_caption(message.chat.id, smsg.id, caption=initial_up_text, reply_markup=cancel_markup)
+            except Exception as e:
+                logger.debug(f"Failed to edit photo caption to Uploading: {e}")
+        else:
+            try:
+                await bot.edit_message_text(message.chat.id, smsg.id, initial_up_text, reply_markup=cancel_markup)
             except Exception:
-                pass
+                try:
+                    await bot.edit_message_caption(message.chat.id, smsg.id, caption=initial_up_text, reply_markup=cancel_markup)
+                except Exception:
+                    pass
+        init_status_tracker(smsg.chat.id, smsg.id, "up", total=file_size, task_id=task_id, file_name=file_display_name, media_type=msg_type)
         up_task = asyncio.create_task(upstatus(up_key, smsg, task_id, file_display_name, msg_type))
 
         upload_start = time.time()
@@ -1944,6 +2022,7 @@ async def handle_private_media_group(message: Message, messages: List[Message]):
     register_task(task_ctx)
 
     down_key = (smsg.chat.id, smsg.id, "down")
+    init_status_tracker(smsg.chat.id, smsg.id, "down", total=0, task_id=task_id, file_name=album_name, media_type="Album")
     down_task = asyncio.create_task(downstatus(down_key, smsg, task_id, album_name, "Album"))
     files = []
     thumbs = []
