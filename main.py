@@ -310,7 +310,7 @@ concurrency_sem = asyncio.Semaphore(5)
 
 MAX_MESSAGE_RANGE = 100
 MAX_MEDIA_GROUP_SIZE = 10
-EDIT_THROTTLE_SECONDS = 4.5
+EDIT_THROTTLE_SECONDS = 1.8
 MAX_BOT_FILE_SIZE = 2000 * 1024 * 1024  # 2 GB Telegram Bot API upload limit
 
 THUMB_DIR = Path("downloads/thumbnails")
@@ -629,12 +629,12 @@ async def start_web_server(port: int = 8080):
 # R3: Rich Visual Progress Formatting
 # ==========================================
 
-def make_progress_bar(percentage: float, length: int = 12) -> str:
-    """Generate visual block progress bar: e.g. [████████░░░░] 65.0%"""
+def make_progress_bar(percentage: float, length: int = 10, filled_char: str = "▰", empty_char: str = "▱") -> str:
+    """Generate visual block progress bar: e.g. [▰▰▰▰▰▰▱▱▱▱] 65.0%"""
     clamped_pct = max(0.0, min(100.0, float(percentage)))
     filled_length = int(round(clamped_pct / 100.0 * length))
     filled_length = max(0, min(length, filled_length))
-    bar = ("█" * filled_length) + ("░" * (length - filled_length))
+    bar = (filled_char * filled_length) + (empty_char * (length - filled_length))
     return f"[{bar}] {clamped_pct:.1f}%"
 
 
@@ -678,21 +678,141 @@ def format_eta(seconds: Optional[Union[int, float]]) -> str:
     return f"{minutes:02d}:{sec:02d}"
 
 
-def render_progress_text(action: str, current: int, total: int, speed: float, eta: float) -> str:
+def _safe_str(val: Any, default: str) -> str:
+    """Safely convert attribute value to string, ignoring mock objects."""
+    if val is None or not isinstance(val, str):
+        return default
+    return val
+
+
+def extract_media_info(msg: Message) -> Tuple[str, int, str]:
+    """Extract (file_name, file_size, media_type) from a Telegram message before downloading."""
+    if getattr(msg, "document", None):
+        doc = msg.document
+        name = getattr(doc, "file_name", None)
+        size = getattr(doc, "file_size", 0)
+        try:
+            size = int(size)
+        except (ValueError, TypeError):
+            size = 0
+        return _safe_str(name, "document"), size, "Document"
+    if getattr(msg, "video", None):
+        vid = msg.video
+        name = getattr(vid, "file_name", None)
+        size = getattr(vid, "file_size", 0)
+        try:
+            size = int(size)
+        except (ValueError, TypeError):
+            size = 0
+        return _safe_str(name, "video.mp4"), size, "Video"
+    if getattr(msg, "audio", None):
+        aud = msg.audio
+        name = getattr(aud, "file_name", None) or getattr(aud, "title", None)
+        size = getattr(aud, "file_size", 0)
+        try:
+            size = int(size)
+        except (ValueError, TypeError):
+            size = 0
+        return _safe_str(name, "audio.mp3"), size, "Audio"
+    if getattr(msg, "photo", None):
+        return "photo.jpg", 0, "Photo"
+    if getattr(msg, "animation", None):
+        anim = msg.animation
+        name = getattr(anim, "file_name", None)
+        size = getattr(anim, "file_size", 0)
+        try:
+            size = int(size)
+        except (ValueError, TypeError):
+            size = 0
+        return _safe_str(name, "animation.gif"), size, "Animation"
+    if getattr(msg, "voice", None):
+        raw_size = getattr(msg.voice, "file_size", 0)
+        try:
+            size = int(raw_size)
+        except (ValueError, TypeError):
+            size = 0
+        return "voice_note.ogg", size, "Voice"
+    if getattr(msg, "sticker", None):
+        set_name = getattr(msg.sticker, "set_name", "sticker")
+        return _safe_str(set_name, "sticker"), 0, "Sticker"
+    return "file", 0, "Media"
+
+
+def render_progress_text(
+    action: str,
+    current: int,
+    total: int,
+    speed: float,
+    eta: float,
+    elapsed: float = 0.0,
+    file_name: Optional[str] = None,
+    media_type: Optional[str] = None,
+) -> str:
     """Calculate and render rich progress status message text."""
-    total = max(total, 0)
-    current = max(current, 0)
+    try:
+        total = max(int(total), 0)
+    except (ValueError, TypeError):
+        total = 0
+    try:
+        current = max(int(current), 0)
+    except (ValueError, TypeError):
+        current = 0
+    try:
+        speed = max(float(speed), 0.0)
+    except (ValueError, TypeError):
+        speed = 0.0
+    try:
+        eta = max(float(eta), 0.0)
+    except (ValueError, TypeError):
+        eta = 0.0
+    try:
+        elapsed = max(float(elapsed), 0.0)
+    except (ValueError, TypeError):
+        elapsed = 0.0
+
+    if file_name is not None and not isinstance(file_name, str):
+        file_name = str(file_name)
+    if media_type is not None and not isinstance(media_type, str):
+        media_type = str(media_type)
     pct = (current * 100.0 / total) if total > 0 else 0.0
     bar = make_progress_bar(pct)
     cur_str = format_size(current)
-    tot_str = format_size(total)
-    spd_str = format_speed(speed)
-    eta_str = format_eta(eta)
+    tot_str = format_size(total) if total > 0 else "Unknown"
+    spd_str = format_speed(speed) if speed > 0 else "Calculating..."
+    eta_str = format_eta(eta) if (speed > 0 and eta > 0) else "Calculating..."
+    elap_str = format_eta(elapsed)
+
+    action_lower = action.lower()
+    if "down" in action_lower:
+        header = "📥 **Downloading Content...**"
+        engine_str = "Fast MTProto Stream"
+    elif "up" in action_lower:
+        header = "📤 **Uploading to Telegram...**"
+        engine_str = "Fast Bot Upload"
+    else:
+        header = f"⚡ **{action}...**"
+        engine_str = "Processing"
+
+    file_block = ""
+    if file_name:
+        display_name = file_name if len(file_name) <= 36 else file_name[:33] + "..."
+        type_badge = f"  •  📁 `{media_type}`" if media_type else ""
+        file_block = (
+            f"📄 **File:** `{display_name}`\n"
+            f"📦 **Size:** `{tot_str}`{type_badge}\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+        )
 
     return (
-        f"__{action}__ : {bar}\n"
-        f"⚡ **Speed:** {spd_str} | ⏳ **ETA:** {eta_str}\n"
-        f"📦 **Size:** {cur_str} / {tot_str}"
+        f"{header}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"{file_block}"
+        f"{bar}\n\n"
+        f"⚡ **Speed:** `{spd_str}`\n"
+        f"⏳ **ETA:** `{eta_str}`  •  ⏱ **Elapsed:** `{elap_str}`\n"
+        f"📊 **Progress:** `{cur_str}` / `{tot_str}`\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"🚀 _Engine: {engine_str}_"
     )
 
 
@@ -803,24 +923,38 @@ async def delayed_delete_status(chat_id: int, smsg_id: int, delay: float = 2.0):
         pass
 
 
-async def status_updater(key: Tuple[int, int, str], message: Message, action_title: str, task_id: Optional[str] = None):
-    """Periodically update Telegram status message with throttled progress edits (4-5s)."""
+async def status_updater(
+    key: Tuple[int, int, str],
+    message: Message,
+    action_title: str,
+    task_id: Optional[str] = None,
+    file_name: Optional[str] = None,
+    media_type: Optional[str] = None,
+):
+    """Periodically update Telegram status message with fast responsive progress edits (1.5-2.0s)."""
     cancel_markup = get_cancel_button(task_id) if task_id else None
     last_rendered_text = ""
     try:
-        # Wait until initial progress data is received
-        while key not in STATUS_TRACKER:
-            await asyncio.sleep(0.3)
+        # Immediate fast check: wait briefly for initial packet to appear
+        for _ in range(4):
+            if key in STATUS_TRACKER:
+                break
+            await asyncio.sleep(0.1)
 
         while key in STATUS_TRACKER:
             data = STATUS_TRACKER.get(key)
             if data:
+                now = time.time()
+                elapsed = max(0.0, now - data.get("start_time", now))
                 text = render_progress_text(
-                    action_title,
-                    data.get("current", 0),
-                    data.get("total", 0),
-                    data.get("speed", 0.0),
-                    data.get("eta", 0.0),
+                    action=action_title,
+                    current=data.get("current", 0),
+                    total=data.get("total", 0),
+                    speed=data.get("speed", 0.0),
+                    eta=data.get("eta", 0.0),
+                    elapsed=elapsed,
+                    file_name=file_name or data.get("file_name"),
+                    media_type=media_type or data.get("media_type"),
                 )
                 if text != last_rendered_text:
                     try:
@@ -842,26 +976,34 @@ async def status_updater(key: Tuple[int, int, str], message: Message, action_tit
         return
 
 
-async def downstatus(key, message, task_id: Optional[str] = None):
+async def downstatus(key, message, task_id: Optional[str] = None, file_name: Optional[str] = None, media_type: Optional[str] = None):
     effective_task_id = task_id
     if not effective_task_id:
         task_ctx = get_task_by_smsg(message.chat.id, message.id)
         if task_ctx:
             effective_task_id = task_ctx.task_id
-    await status_updater(key, message, "Downloading", effective_task_id)
+    await status_updater(key, message, "Downloading", effective_task_id, file_name, media_type)
 
 
-async def upstatus(key, message, task_id: Optional[str] = None):
+async def upstatus(key, message, task_id: Optional[str] = None, file_name: Optional[str] = None, media_type: Optional[str] = None):
     effective_task_id = task_id
     if not effective_task_id:
         task_ctx = get_task_by_smsg(message.chat.id, message.id)
         if task_ctx:
             effective_task_id = task_ctx.task_id
-    await status_updater(key, message, "Uploading", effective_task_id)
+    await status_updater(key, message, "Uploading", effective_task_id, file_name, media_type)
 
 
-def progress(current: int, total: int, smsg: Message, type_str: str, task_id: Optional[str] = None):
-    """Track download/upload progress keyed by the status message, checking for task cancellation."""
+def progress(
+    current: int,
+    total: int,
+    smsg: Message,
+    type_str: str,
+    task_id: Optional[str] = None,
+    file_name: Optional[str] = None,
+    media_type: Optional[str] = None,
+):
+    """Track download/upload progress with moving-window smoothed speed and accurate ETA."""
     effective_task_id = task_id
     if not effective_task_id:
         task_ctx = get_task_by_smsg(smsg.chat.id, smsg.id)
@@ -878,25 +1020,44 @@ def progress(current: int, total: int, smsg: Message, type_str: str, task_id: Op
         STATUS_TRACKER[key] = {
             "start_time": now,
             "last_time": now,
+            "last_current": current,
             "current": current,
             "total": total,
             "speed": 0.0,
             "eta": 0.0,
             "task_id": effective_task_id,
             "type": type_str,
+            "file_name": file_name,
+            "media_type": media_type,
         }
     else:
         entry = STATUS_TRACKER[key]
-        elapsed = now - entry["start_time"]
-        speed = (current / elapsed) if elapsed > 0 else 0.0
-        remaining = max(0, total - current)
-        eta = (remaining / speed) if speed > 0 else 0.0
+        dt = now - entry.get("last_time", now)
+        # Update speed calculation every 0.3s for smooth and responsive metrics
+        if dt >= 0.3:
+            db = current - entry.get("last_current", 0)
+            if db > 0 and dt > 0:
+                instant_speed = db / dt
+                prev_speed = entry.get("speed", 0.0)
+                # Exponential smoothing: 75% instant, 25% previous
+                speed = (instant_speed * 0.75) + (prev_speed * 0.25) if prev_speed > 0 else instant_speed
+            else:
+                speed = entry.get("speed", 0.0)
+
+            remaining = max(0, total - current)
+            eta = (remaining / speed) if speed > 0 else 0.0
+
+            entry["speed"] = speed
+            entry["eta"] = eta
+            entry["last_time"] = now
+            entry["last_current"] = current
 
         entry["current"] = current
         entry["total"] = total
-        entry["speed"] = speed
-        entry["eta"] = eta
-        entry["last_time"] = now
+        if file_name and not entry.get("file_name"):
+            entry["file_name"] = file_name
+        if media_type and not entry.get("media_type"):
+            entry["media_type"] = media_type
 
 
 @bot.on_callback_query(filters.regex(r"^cancel_(.+)"))
@@ -1450,6 +1611,9 @@ async def handle_private_message(message: Message, msg: Message):
     user_id = message.from_user.id if message.from_user else 0
     custom_thumb = get_user_thumb(user_id)
 
+    # Extract upfront media information before downloading for instant UI feedback
+    init_name, init_size, init_type = extract_media_info(msg)
+
     task_id = uuid.uuid4().hex[:10]
     task_ctx = TaskContext(
         task_id=task_id,
@@ -1460,9 +1624,19 @@ async def handle_private_message(message: Message, msg: Message):
     register_task(task_ctx)
 
     cancel_markup = get_cancel_button(task_id)
+    initial_down_text = render_progress_text(
+        action="Downloading",
+        current=0,
+        total=init_size,
+        speed=0.0,
+        eta=0.0,
+        elapsed=0.0,
+        file_name=init_name,
+        media_type=init_type,
+    )
     smsg = await bot.send_message(
         message.chat.id,
-        '__Downloading__',
+        initial_down_text,
         reply_to_message_id=message.id,
         reply_markup=cancel_markup,
     )
@@ -1474,25 +1648,29 @@ async def handle_private_message(message: Message, msg: Message):
     down_key = (smsg.chat.id, smsg.id, "down")
     up_key = (smsg.chat.id, smsg.id, "up")
 
-    down_task = asyncio.create_task(downstatus(down_key, smsg, task_id))
+    down_task = asyncio.create_task(downstatus(down_key, smsg, task_id, init_name, init_type))
     up_task = None
     file = None
     thumb = None
     sent_media = None
-    file_display_name = "File"
+    file_display_name = init_name or "File"
     smsg_deleted = False
 
     try:
         download_start = time.time()
         # download_media runs with max_concurrent_transmissions=10 connections
-        file = await acc.download_media(msg, progress=progress, progress_args=[smsg, "down", task_id])
+        file = await acc.download_media(
+            msg,
+            progress=progress,
+            progress_args=[smsg, "down", task_id, init_name, init_type],
+        )
         download_duration = max(time.time() - download_start, 0.01)
 
         if task_ctx.is_cancelled or file is None:
             return
         task_ctx.track_file(file)
 
-        file_size = os.path.getsize(file) if os.path.exists(file) else 0
+        file_size = os.path.getsize(file) if os.path.exists(file) else init_size
 
         STATUS_TRACKER.pop(down_key, None)
         if down_task and not down_task.done():
@@ -1501,8 +1679,18 @@ async def handle_private_message(message: Message, msg: Message):
         if task_ctx.is_cancelled:
             return
 
-        await bot.edit_message_text(message.chat.id, smsg.id, "__Uploading__", reply_markup=cancel_markup)
-        up_task = asyncio.create_task(upstatus(up_key, smsg, task_id))
+        initial_up_text = render_progress_text(
+            action="Uploading",
+            current=0,
+            total=file_size,
+            speed=0.0,
+            eta=0.0,
+            elapsed=0.0,
+            file_name=file_display_name,
+            media_type=msg_type,
+        )
+        await bot.edit_message_text(message.chat.id, smsg.id, initial_up_text, reply_markup=cancel_markup)
+        up_task = asyncio.create_task(upstatus(up_key, smsg, task_id, file_display_name, msg_type))
 
         upload_start = time.time()
         if "Document" == msg_type:
@@ -1535,7 +1723,7 @@ async def handle_private_message(message: Message, msg: Message):
                 caption_entities=msg.caption_entities if caption == msg.caption else None,
                 reply_to_message_id=message.id,
                 progress=progress,
-                progress_args=[smsg, "up", task_id],
+                progress_args=[smsg, "up", task_id, file_display_name, msg_type],
             )
 
         elif "Video" == msg_type:
@@ -1569,7 +1757,7 @@ async def handle_private_message(message: Message, msg: Message):
                 caption_entities=msg.caption_entities if caption == msg.caption else None,
                 reply_to_message_id=message.id,
                 progress=progress,
-                progress_args=[smsg, "up", task_id],
+                progress_args=[smsg, "up", task_id, file_display_name, msg_type],
             )
 
         elif "Animation" == msg_type:
@@ -1596,7 +1784,7 @@ async def handle_private_message(message: Message, msg: Message):
                 caption_entities=msg.caption_entities if caption == msg.caption else None,
                 reply_to_message_id=message.id,
                 progress=progress,
-                progress_args=[smsg, "up", task_id],
+                progress_args=[smsg, "up", task_id, file_display_name, msg_type],
             )
 
         elif "Audio" == msg_type:
@@ -1626,7 +1814,7 @@ async def handle_private_message(message: Message, msg: Message):
                 caption_entities=msg.caption_entities if caption == msg.caption else None,
                 reply_to_message_id=message.id,
                 progress=progress,
-                progress_args=[smsg, "up", task_id],
+                progress_args=[smsg, "up", task_id, file_display_name, msg_type],
             )
 
         elif "Photo" == msg_type:
@@ -1703,9 +1891,20 @@ async def handle_private_media_group(message: Message, messages: List[Message]):
     register_task(task_ctx)
 
     cancel_markup = get_cancel_button(task_id)
+    album_name = f"Media Album ({len(messages)} items)"
+    initial_down_text = render_progress_text(
+        action="Downloading",
+        current=0,
+        total=0,
+        speed=0.0,
+        eta=0.0,
+        elapsed=0.0,
+        file_name=album_name,
+        media_type="Album",
+    )
     smsg = await bot.send_message(
         message.chat.id,
-        '__Downloading__',
+        initial_down_text,
         reply_to_message_id=message.id,
         reply_markup=cancel_markup,
     )
@@ -1714,7 +1913,7 @@ async def handle_private_media_group(message: Message, messages: List[Message]):
     register_task(task_ctx)
 
     down_key = (smsg.chat.id, smsg.id, "down")
-    down_task = asyncio.create_task(downstatus(down_key, smsg, task_id))
+    down_task = asyncio.create_task(downstatus(down_key, smsg, task_id, album_name, "Album"))
     files = []
     thumbs = []
     media = []
@@ -1722,7 +1921,7 @@ async def handle_private_media_group(message: Message, messages: List[Message]):
 
     try:
         download_start = time.time()
-        for msg in messages:
+        for idx, msg in enumerate(messages, 1):
             if task_ctx.is_cancelled:
                 return
 
@@ -1730,7 +1929,12 @@ async def handle_private_media_group(message: Message, messages: List[Message]):
             if msg_type not in ("Photo", "Video", "Document", "Audio"):
                 raise ValueError(f"Message type {msg_type} can't be sent in a media group.")
 
-            file = await acc.download_media(msg, progress=progress, progress_args=[smsg, "down", task_id])
+            item_name = f"Item {idx}/{len(messages)} ({msg_type})"
+            file = await acc.download_media(
+                msg,
+                progress=progress,
+                progress_args=[smsg, "down", task_id, item_name, msg_type],
+            )
             if task_ctx.is_cancelled or file is None:
                 return
             files.append(file)
@@ -1818,7 +2022,18 @@ async def handle_private_media_group(message: Message, messages: List[Message]):
         if task_ctx.is_cancelled:
             return
 
-        await bot.edit_message_text(message.chat.id, smsg.id, "__Uploading__", reply_markup=cancel_markup)
+        total_size = sum(os.path.getsize(f) for f in files if os.path.exists(f))
+        initial_up_text = render_progress_text(
+            action="Uploading",
+            current=0,
+            total=total_size,
+            speed=0.0,
+            eta=0.0,
+            elapsed=0.0,
+            file_name=album_name,
+            media_type="Album",
+        )
+        await bot.edit_message_text(message.chat.id, smsg.id, initial_up_text, reply_markup=cancel_markup)
 
         upload_start = time.time()
         # Send media in chunks of MAX_MEDIA_GROUP_SIZE to respect Telegram's 10-item limit
@@ -1834,7 +2049,6 @@ async def handle_private_media_group(message: Message, messages: List[Message]):
         smsg_deleted = True
 
         # Send separate completion message for media group
-        total_size = sum(os.path.getsize(f) for f in files if os.path.exists(f))
         report_thumb = thumbs[0] if (thumbs and os.path.exists(thumbs[0])) else None
         if not report_thumb:
             for f in files:

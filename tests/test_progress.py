@@ -12,25 +12,25 @@ from main import (
 def test_make_progress_bar():
     # 0%
     bar_0 = make_progress_bar(0.0, length=12)
-    assert bar_0 == "[░░░░░░░░░░░░] 0.0%"
+    assert bar_0 == "[▱▱▱▱▱▱▱▱▱▱▱▱] 0.0%"
 
     # 100%
     bar_100 = make_progress_bar(100.0, length=12)
-    assert bar_100 == "[████████████] 100.0%"
+    assert bar_100 == "[▰▰▰▰▰▰▰▰▰▰▰▰] 100.0%"
 
     # 50%
     bar_50 = make_progress_bar(50.0, length=12)
-    assert bar_50 == "[██████░░░░░░] 50.0%"
+    assert bar_50 == "[▰▰▰▰▰▰▱▱▱▱▱▱] 50.0%"
 
     # 65% (8 filled, 4 empty)
     bar_65 = make_progress_bar(65.0, length=12)
-    assert bar_65 == "[████████░░░░] 65.0%"
+    assert bar_65 == "[▰▰▰▰▰▰▰▰▱▱▱▱] 65.0%"
 
     # Clamping negative and over-100 values
     bar_neg = make_progress_bar(-10.0, length=12)
-    assert bar_neg == "[░░░░░░░░░░░░] 0.0%"
+    assert bar_neg == "[▱▱▱▱▱▱▱▱▱▱▱▱] 0.0%"
     bar_over = make_progress_bar(150.0, length=12)
-    assert bar_over == "[████████████] 100.0%"
+    assert bar_over == "[▰▰▰▰▰▰▰▰▰▰▰▰] 100.0%"
 
 
 def test_format_size():
@@ -103,14 +103,21 @@ def test_render_progress_text():
         total=int(20.0 * 1024 * 1024),
         speed=4.2 * 1024 * 1024,
         eta=83,
+        elapsed=15.0,
+        file_name="example_video.mp4",
+        media_type="Video",
     )
-    assert "__Downloading__ :" in text
-    assert "[████████░░░░] 62.5%" in text
-    assert "⚡ **Speed:** 4.2 MB/s" in text
-    assert "⏳ **ETA:** 01:23" in text
-    assert "📦 **Size:** 12.50 MB / 20.00 MB" in text
+    assert "📥 **Downloading Content...**" in text
+    assert "📄 **File:** `example_video.mp4`" in text
+    assert "📁 `Video`" in text
+    assert "[▰▰▰▰▰▰▱▱▱▱] 62.5%" in text
+    assert "⚡ **Speed:** `4.2 MB/s`" in text
+    assert "⏳ **ETA:** `01:23`" in text
+    assert "⏱ **Elapsed:** `00:15`" in text
+    assert "📊 **Progress:** `12.50 MB` / `20.00 MB`" in text
+    assert "Fast MTProto Stream" in text
 
 
 def test_edit_throttle_range():
-    # Verify throttle interval is strictly within the 4-5 seconds rate limit window
-    assert 4.0 <= EDIT_THROTTLE_SECONDS <= 5.0
+    # Verify throttle interval is fast, responsive, and within safe Telegram rate-limiting guidelines (1.0s to 3.0s)
+    assert 1.0 <= EDIT_THROTTLE_SECONDS <= 3.0
