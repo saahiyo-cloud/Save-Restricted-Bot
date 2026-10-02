@@ -296,10 +296,11 @@ async def test_send_completion_report_with_thumb(tmp_path):
             thumb_path=str(thumb_file),
             reply_to_message_id=555,
         )
-        mock_send_photo.assert_called_once()
-        mock_send_msg.assert_not_called()
-        assert "demo.mp4" in mock_send_photo.call_args[1]["caption"]
-        assert "Download Time:" in mock_send_photo.call_args[1]["caption"]
+        mock_send_photo.assert_not_called()
+        mock_send_msg.assert_called_once()
+        sent_text = mock_send_msg.call_args[1]["text"]
+        assert "demo.mp4" in sent_text
+        assert "Download Time:" in sent_text
 
 
 @pytest.mark.asyncio

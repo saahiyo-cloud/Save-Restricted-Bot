@@ -477,7 +477,7 @@ async def send_completion_report(
     user_id: Optional[int] = None,
     reply_to_message_id: Optional[int] = None,
 ):
-    """Send a separate message detailing file transfer statistics, showing thumbnail preview if available."""
+    """Send a separate message detailing file transfer statistics as a clean text card (no thumbnail attached on completion)."""
     bot_username = getattr(getattr(bot, "me", None), "username", None)
     custom_note = get_user_custom_msg(user_id) if user_id else None
     text = build_completion_message(
@@ -490,28 +490,6 @@ async def send_completion_report(
         custom_note=custom_note,
     )
 
-    # If a valid image thumbnail file exists on disk, send as photo with the caption to show thumbnail
-    if thumb_path and os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
-        try:
-            await bot.send_photo(
-                chat_id=chat_id,
-                photo=thumb_path,
-                caption=text,
-                reply_to_message_id=reply_to_message_id,
-            )
-            return
-        except Exception:
-            try:
-                await bot.send_photo(
-                    chat_id=chat_id,
-                    photo=thumb_path,
-                    caption=text,
-                )
-                return
-            except Exception as e:
-                logger.debug(f"Could not send thumbnail report as photo: {e}")
-
-    # Fallback to rich markdown text message
     try:
         await bot.send_message(
             chat_id=chat_id,
@@ -970,7 +948,20 @@ async def status_updater(
                     except MessageIdInvalid:
                         break
                     except Exception:
-                        pass
+                        try:
+                            await bot.edit_message_caption(
+                                message.chat.id,
+                                message.id,
+                                caption=text,
+                                reply_markup=cancel_markup,
+                            )
+                            last_rendered_text = text
+                        except MessageNotModified:
+                            pass
+                        except MessageIdInvalid:
+                            break
+                        except Exception:
+                            pass
             await asyncio.sleep(EDIT_THROTTLE_SECONDS)
     except asyncio.CancelledError:
         return
@@ -1634,12 +1625,45 @@ async def handle_private_message(message: Message, msg: Message):
         file_name=init_name,
         media_type=init_type,
     )
-    smsg = await bot.send_message(
-        message.chat.id,
-        initial_down_text,
-        reply_to_message_id=message.id,
-        reply_markup=cancel_markup,
-    )
+
+    # Fetch thumbnail preview upfront if available to display live preview during download
+    preview_thumb = custom_thumb
+    if not preview_thumb:
+        try:
+            if msg_type == "Video" and getattr(msg, "video", None) and getattr(msg.video, "thumbs", None):
+                preview_thumb = await acc.download_media(msg.video.thumbs[0].file_id)
+                task_ctx.track_file(preview_thumb)
+            elif msg_type == "Document" and getattr(msg, "document", None) and getattr(msg.document, "thumbs", None):
+                preview_thumb = await acc.download_media(msg.document.thumbs[0].file_id)
+                task_ctx.track_file(preview_thumb)
+            elif msg_type == "Audio" and getattr(msg, "audio", None) and getattr(msg.audio, "thumbs", None):
+                preview_thumb = await acc.download_media(msg.audio.thumbs[0].file_id)
+                task_ctx.track_file(preview_thumb)
+        except Exception:
+            preview_thumb = None
+
+    smsg = None
+    if preview_thumb and os.path.exists(preview_thumb) and os.path.getsize(preview_thumb) > 0:
+        try:
+            smsg = await bot.send_photo(
+                message.chat.id,
+                photo=preview_thumb,
+                caption=initial_down_text,
+                reply_to_message_id=message.id,
+                reply_markup=cancel_markup,
+            )
+        except Exception as e:
+            logger.debug(f"Failed to send thumbnail preview status message: {e}")
+            smsg = None
+
+    if not smsg:
+        smsg = await bot.send_message(
+            message.chat.id,
+            initial_down_text,
+            reply_to_message_id=message.id,
+            reply_markup=cancel_markup,
+        )
+
     task_ctx.smsg_id = smsg.id
     task_ctx.smsg = smsg
     register_task(task_ctx)
@@ -1651,7 +1675,7 @@ async def handle_private_message(message: Message, msg: Message):
     down_task = asyncio.create_task(downstatus(down_key, smsg, task_id, init_name, init_type))
     up_task = None
     file = None
-    thumb = None
+    thumb = preview_thumb
     sent_media = None
     file_display_name = init_name or "File"
     smsg_deleted = False
@@ -1689,7 +1713,13 @@ async def handle_private_message(message: Message, msg: Message):
             file_name=file_display_name,
             media_type=msg_type,
         )
-        await bot.edit_message_text(message.chat.id, smsg.id, initial_up_text, reply_markup=cancel_markup)
+        try:
+            await bot.edit_message_text(message.chat.id, smsg.id, initial_up_text, reply_markup=cancel_markup)
+        except Exception:
+            try:
+                await bot.edit_message_caption(message.chat.id, smsg.id, caption=initial_up_text, reply_markup=cancel_markup)
+            except Exception:
+                pass
         up_task = asyncio.create_task(upstatus(up_key, smsg, task_id, file_display_name, msg_type))
 
         upload_start = time.time()
@@ -1697,7 +1727,7 @@ async def handle_private_message(message: Message, msg: Message):
             doc_name = getattr(msg.document, "file_name", None) or os.path.basename(file)
             file_display_name = doc_name
             caption = apply_caption_template(user_id, msg.caption, doc_name)
-            thumb = custom_thumb
+            thumb = custom_thumb or preview_thumb
             if not thumb:
                 try:
                     if msg.document.thumbs:
@@ -1730,7 +1760,7 @@ async def handle_private_message(message: Message, msg: Message):
             vid_name = getattr(msg.video, "file_name", None) or os.path.basename(file)
             file_display_name = vid_name
             caption = apply_caption_template(user_id, msg.caption, vid_name)
-            thumb = custom_thumb
+            thumb = custom_thumb or preview_thumb
             if not thumb:
                 try:
                     if msg.video.thumbs:
@@ -1749,12 +1779,13 @@ async def handle_private_message(message: Message, msg: Message):
             sent_media = await bot.send_video(
                 message.chat.id,
                 file,
-                duration=msg.video.duration or 0,
-                width=msg.video.width or 0,
-                height=msg.video.height or 0,
+                duration=getattr(msg.video, "duration", 0) or 0,
+                width=getattr(msg.video, "width", 0) or 0,
+                height=getattr(msg.video, "height", 0) or 0,
                 thumb=thumb,
                 caption=caption,
                 caption_entities=msg.caption_entities if caption == msg.caption else None,
+                supports_streaming=True,
                 reply_to_message_id=message.id,
                 progress=progress,
                 progress_args=[smsg, "up", task_id, file_display_name, msg_type],
