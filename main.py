@@ -20,6 +20,7 @@ from typing import Optional, Set, Dict, Any, Union, Tuple, List
 from dotenv import load_dotenv
 
 import pyrogram
+import pyrogram.utils
 from pyrogram import Client, filters, idle
 from pyrogram.errors import (
     UserAlreadyParticipant,
@@ -40,6 +41,42 @@ from pyrogram.types import (
     CallbackQuery,
     Message,
 )
+
+# Monkey-patch Pyrogram for modern 64-bit Telegram Channel / Chat IDs
+# Telegram creates supergroups and channels with IDs > 2147483647 (e.g. -1003533041485)
+pyrogram.utils.MIN_CHANNEL_ID = -1009999999999999999
+pyrogram.utils.MIN_CHAT_ID = -999999999999
+
+_orig_get_peer_type = pyrogram.utils.get_peer_type
+
+
+def _patched_get_peer_type(peer_id: int) -> str:
+    if peer_id < 0:
+        if peer_id <= pyrogram.utils.MAX_CHANNEL_ID:
+            return "channel"
+        return "chat"
+    elif peer_id > 0:
+        return "user"
+    raise ValueError(f"Peer id invalid: {peer_id}")
+
+
+pyrogram.utils.get_peer_type = _patched_get_peer_type
+
+# Patch pyrogram.types.Message._parse to safely handle unresolvable reply messages without crashing dispatcher
+_orig_message_parse = pyrogram.types.Message._parse
+
+
+@staticmethod
+async def _patched_message_parse(client, message, users, chats, is_scheduled: bool = False, replies: int = 1):
+    try:
+        return await _orig_message_parse(client, message, users, chats, is_scheduled=is_scheduled, replies=replies)
+    except Exception as exc:
+        if replies > 0:
+            return await _orig_message_parse(client, message, users, chats, is_scheduled=is_scheduled, replies=0)
+        raise exc
+
+
+pyrogram.types.Message._parse = _patched_message_parse
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("SaveRestrictedBot")

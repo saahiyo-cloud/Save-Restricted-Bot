@@ -106,3 +106,45 @@ def test_get_message_type():
 
     msg.text = "Hello"
     assert get_message_type(msg) == "Text"
+
+
+def test_64bit_channel_peer_resolution():
+    import pyrogram.utils as utils
+
+    # Modern 64-bit channel ID > 2147483647
+    peer_id = -1003533041485
+    assert utils.get_peer_type(peer_id) == "channel"
+    assert utils.get_channel_id(peer_id) == 3533041485
+
+    # Standard private supergroup ID
+    assert utils.get_peer_type(-1001234567890) == "channel"
+
+    # Basic group chat ID
+    assert utils.get_peer_type(-123456789) == "chat"
+
+    # User ID
+    assert utils.get_peer_type(7240138588) == "user"
+
+    # Invalid ID
+    with pytest.raises(ValueError):
+        utils.get_peer_type(0)
+
+
+@pytest.mark.asyncio
+async def test_patched_message_parse_reply_fallback():
+    import pyrogram.types as types
+    from unittest.mock import patch
+
+    called_replies = []
+
+    async def fake_parse(client, message, users, chats, is_scheduled=False, replies=1):
+        called_replies.append(replies)
+        if replies > 0:
+            raise ValueError("Peer id invalid: -1003533041485")
+        return "fallback_message_success"
+
+    with patch("main._orig_message_parse", side_effect=fake_parse):
+        res = await types.Message._parse(None, None, {}, {}, replies=1)
+        assert res == "fallback_message_success"
+        assert called_replies == [1, 0]
+
