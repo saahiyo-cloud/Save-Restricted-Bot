@@ -1,129 +1,957 @@
-import pyrogram
-from pyrogram import Client, filters
-from pyrogram.errors import UserAlreadyParticipant, InviteHashExpired, UsernameNotOccupied
-from pyrogram.types import InputMediaPhoto, InputMediaVideo, InputMediaDocument, InputMediaAudio
+import asyncio
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
 import re
-import time
-import threading
-import json
 import os
+import sys
+import json
+import time
+import math
+import uuid
+import logging
+import functools
+import shutil
 from pathlib import Path
+from typing import Optional, Set, Dict, Any, Union, Tuple, List
 
-CONFIG_FILE = Path(__file__).with_name('config.json')
-with CONFIG_FILE.open('r') as f: DATA = json.load(f)
+from dotenv import load_dotenv
+
+import pyrogram
+from pyrogram import Client, filters, idle
+from pyrogram.errors import (
+    UserAlreadyParticipant,
+    InviteHashExpired,
+    UsernameNotOccupied,
+    FloodWait,
+    MessageNotModified,
+    MessageIdInvalid,
+    RPCError,
+)
+from pyrogram.types import (
+    InputMediaPhoto,
+    InputMediaVideo,
+    InputMediaDocument,
+    InputMediaAudio,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+    CallbackQuery,
+    Message,
+)
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("SaveRestrictedBot")
+
+BOT_START_TIME = time.time()
 
 
-owner_ids = {int(owner_id) for owner_id in DATA.get("OWNER_ID", [])}
-bot_token = DATA.get("TOKEN")
-api_hash = DATA.get("HASH")
-api_id = DATA.get("ID")
-bot = Client("mybot", api_id=api_id, api_hash=api_hash, bot_token=bot_token)
+# ==========================================
+# R2: Configuration Loading & Fallback Logic
+# ==========================================
 
-ss = DATA.get("STRING")
+def parse_owner_ids(raw_val: Any) -> Set[int]:
+    """Parse owner ID(s) from various formats (int, list, comma-separated string, JSON array)."""
+    if raw_val is None:
+        return set()
+    if isinstance(raw_val, (int, float)):
+        return {int(raw_val)}
+    if isinstance(raw_val, (list, tuple, set)):
+        ids = set()
+        for x in raw_val:
+            try:
+                ids.add(int(x))
+            except (ValueError, TypeError):
+                pass
+        return ids
+    if isinstance(raw_val, str):
+        val = raw_val.strip()
+        if not val:
+            return set()
+        if val.startswith("[") and val.endswith("]"):
+            try:
+                parsed = json.loads(val)
+                if isinstance(parsed, list):
+                    return parse_owner_ids(parsed)
+            except Exception:
+                pass
+        parts = re.split(r"[,;\s]+", val)
+        ids = set()
+        for p in parts:
+            p = p.strip().strip("'\"")
+            if p:
+                try:
+                    ids.add(int(p))
+                except ValueError:
+                    pass
+        return ids
+    return set()
+
+
+def load_config(config_file: Optional[Union[str, Path]] = None, env_file: Optional[Union[str, Path]] = None) -> Dict[str, Any]:
+    """
+    Load configuration with resolution order:
+    1. System Environment Variables
+    2. .env file
+    3. config.json fallback
+    """
+    # Load .env without overriding existing environment variables
+    if env_file:
+        load_dotenv(dotenv_path=env_file, override=False)
+    else:
+        load_dotenv(override=False)
+
+    # Read config.json fallback if available
+    json_data: Dict[str, Any] = {}
+    config_path = Path(config_file) if config_file else Path(__file__).with_name('config.json')
+    if config_path.exists():
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                json_data = json.load(f)
+        except Exception as e:
+            logger.warning(f"Unable to read JSON configuration from {config_path}: {e}")
+            json_data = {}
+
+    def get_val(key: str) -> Optional[Any]:
+        env_val = os.environ.get(key)
+        if env_val is not None and str(env_val).strip() != "":
+            return env_val.strip()
+        return json_data.get(key)
+
+    token = get_val("TOKEN")
+
+    api_id_raw = get_val("ID")
+    try:
+        api_id = int(api_id_raw) if api_id_raw is not None and str(api_id_raw).strip() != "" else None
+    except (ValueError, TypeError):
+        api_id = api_id_raw
+
+    api_hash = get_val("HASH")
+
+    ss_val = get_val("STRING")
+    if ss_val is not None:
+        ss_str = str(ss_val).strip()
+        ss_val = None if (not ss_str or ss_str.lower() == "none") else ss_str
+
+    owner_raw = os.environ.get("OWNER_ID")
+    if owner_raw is None or str(owner_raw).strip() == "":
+        owner_raw = json_data.get("OWNER_ID")
+    owner_ids = parse_owner_ids(owner_raw)
+
+    return {
+        "TOKEN": token,
+        "ID": api_id,
+        "HASH": api_hash,
+        "STRING": ss_val,
+        "OWNER_ID": owner_ids,
+        "RAW_JSON": json_data,
+    }
+
+
+CONFIG = load_config()
+
+owner_ids = CONFIG["OWNER_ID"]
+bot_token = CONFIG["TOKEN"]
+api_hash = CONFIG["HASH"]
+api_id = CONFIG["ID"]
+ss = CONFIG["STRING"]
+
+
+# ==========================================
+# R1: FloodWait Automatic Retry Handling
+# ==========================================
+
+FLOODWAIT_METHODS = [
+    "send_message",
+    "edit_message_text",
+    "delete_messages",
+    "copy_message",
+    "copy_media_group",
+    "send_document",
+    "send_video",
+    "send_animation",
+    "send_sticker",
+    "send_voice",
+    "send_audio",
+    "send_photo",
+    "send_media_group",
+    "get_messages",
+    "get_media_group",
+    "join_chat",
+    "download_media",
+]
+
+
+def retry_on_floodwait(func):
+    """Decorator/wrapper to catch FloodWait and retry after awaiting (e.value + 1)."""
+    @functools.wraps(func)
+    async def wrapper(*args, **kwargs):
+        while True:
+            try:
+                return await func(*args, **kwargs)
+            except FloodWait as e:
+                wait_time = int(getattr(e, "value", getattr(e, "x", 0)) or 0) + 1
+                logger.warning(
+                    f"FloodWait exception in {getattr(func, '__name__', str(func))}. "
+                    f"Awaiting {wait_time}s before retrying."
+                )
+                await asyncio.sleep(wait_time)
+    return wrapper
+
+
+async def call_with_floodwait(func, *args, **kwargs):
+    """Execute a callable or coroutine with automatic FloodWait retry."""
+    while True:
+        try:
+            return await func(*args, **kwargs)
+        except FloodWait as e:
+            wait_time = int(getattr(e, "value", getattr(e, "x", 0)) or 0) + 1
+            logger.warning(f"FloodWait encountered: awaiting {wait_time}s before retrying.")
+            await asyncio.sleep(wait_time)
+
+
+def wrap_client_with_floodwait(client: Optional[Client]) -> Optional[Client]:
+    """Automatically attach FloodWait retry handling to Telegram client RPC methods."""
+    if client is None:
+        return None
+    for method_name in FLOODWAIT_METHODS:
+        if hasattr(client, method_name):
+            orig_method = getattr(client, method_name)
+            if getattr(orig_method, "_is_floodwait_wrapped", False) is True:
+                continue
+            wrapped = retry_on_floodwait(orig_method)
+            wrapped._is_floodwait_wrapped = True
+            setattr(client, method_name, wrapped)
+    return client
+
+
+# max_concurrent_transmissions=10 enables up to 10 parallel DC connections for file transfers
+bot = Client("mybot", api_id=api_id, api_hash=api_hash, bot_token=bot_token, max_concurrent_transmissions=10)
+wrap_client_with_floodwait(bot)
+
 if ss is not None:
-    acc = Client("myacc" ,api_id=api_id, api_hash=api_hash, session_string=ss)
-    acc.start()
-else: acc = None
+    acc = Client("myacc", api_id=api_id, api_hash=api_hash, session_string=ss, max_concurrent_transmissions=10)
+    wrap_client_with_floodwait(acc)
+else:
+    acc = None
 
+# Lock for user session RPC calls (get_messages, join_chat) to prevent concurrent socket reads
+acc_lock = asyncio.Lock()
+# Semaphore for processing multiple messages concurrently
+concurrency_sem = asyncio.Semaphore(5)
 
 MAX_MESSAGE_RANGE = 100
+MAX_MEDIA_GROUP_SIZE = 10
+EDIT_THROTTLE_SECONDS = 4.5
+MAX_BOT_FILE_SIZE = 2000 * 1024 * 1024  # 2 GB Telegram Bot API upload limit
+
+THUMB_DIR = Path("downloads/thumbnails")
+CAPTION_DIR = Path("downloads/captions")
+THUMB_DIR.mkdir(parents=True, exist_ok=True)
+CAPTION_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def remove_file(path):
-    if path is not None and os.path.exists(path):
-        os.remove(path)
+def get_user_thumb(user_id: int) -> Optional[str]:
+    """Retrieve path to user's custom thumbnail if it exists."""
+    thumb_path = THUMB_DIR / f"{user_id}.jpg"
+    return str(thumb_path) if thumb_path.exists() else None
 
 
-def status_file(message, type):
-    return f"{message.chat.id}_{message.id}_{type}status.txt"
+def set_user_thumb(user_id: int, file_path: str):
+    """Save custom thumbnail for a user."""
+    target = THUMB_DIR / f"{user_id}.jpg"
+    shutil.copyfile(file_path, target)
 
 
-def delete_status_message(message, smsg):
+def del_user_thumb(user_id: int) -> bool:
+    """Delete custom thumbnail for a user."""
+    target = THUMB_DIR / f"{user_id}.jpg"
+    if target.exists():
+        try:
+            target.unlink()
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def get_user_caption_template(user_id: int) -> Optional[str]:
+    """Retrieve user's custom caption template."""
+    caption_path = CAPTION_DIR / f"{user_id}.txt"
+    if caption_path.exists():
+        try:
+            return caption_path.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    return None
+
+
+def set_user_caption_template(user_id: int, template: str):
+    """Save custom caption template for a user."""
+    target = CAPTION_DIR / f"{user_id}.txt"
+    target.write_text(template, encoding="utf-8")
+
+
+def del_user_caption_template(user_id: int) -> bool:
+    """Delete custom caption template for a user."""
+    target = CAPTION_DIR / f"{user_id}.txt"
+    if target.exists():
+        try:
+            target.unlink()
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def apply_caption_template(user_id: int, original_caption: Optional[str], filename: Optional[str] = None) -> Optional[str]:
+    """Format caption according to user's saved template with {caption} and {filename} variables."""
+    template = get_user_caption_template(user_id)
+    if not template:
+        return original_caption
+    res = template.replace("{caption}", original_caption or "")
+    res = res.replace("{filename}", filename or "")
+    return res.strip()
+
+
+def check_file_size_limit(msg: Message) -> Tuple[bool, int]:
+    """Check if media in message exceeds Telegram's 2 GB bot upload limit."""
+    media_obj = getattr(msg, "document", None) or getattr(msg, "video", None) or getattr(msg, "audio", None)
+    raw_size = getattr(media_obj, "file_size", 0)
     try:
-        bot.delete_messages(message.chat.id,[smsg.id])
-    except:
+        size = int(raw_size)
+    except (ValueError, TypeError):
+        size = 0
+    return size > MAX_BOT_FILE_SIZE, size
+
+
+def generate_video_thumbnail(video_path: str) -> Optional[str]:
+    """Extract a thumbnail frame from video using ffmpeg if available."""
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin or not os.path.exists(video_path):
+        return None
+    thumb_path = video_path + "_thumb.jpg"
+    try:
+        import subprocess
+        cmd = [
+            ffmpeg_bin,
+            "-ss", "00:00:01",
+            "-i", video_path,
+            "-vframes", "1",
+            "-q:v", "2",
+            "-y",
+            thumb_path,
+        ]
+        res = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        if res.returncode == 0 and os.path.exists(thumb_path):
+            return thumb_path
+    except Exception:
+        pass
+    return None
+
+
+async def start_web_server(port: int = 8080):
+    """Lightweight HTTP server for cloud platform healthcheck pings (Render, Koyeb, Railway, InstaCloud)."""
+    async def handle_client(reader, writer):
+        try:
+            await reader.readline()
+            response_body = json.dumps({
+                "status": "ok",
+                "uptime": get_readable_time(time.time() - BOT_START_TIME),
+                "active_tasks": len(ACTIVE_TASKS),
+            }).encode("utf-8")
+            response = (
+                b"HTTP/1.1 200 OK\r\n"
+                b"Content-Type: application/json\r\n"
+                b"Content-Length: " + str(len(response_body)).encode() + b"\r\n"
+                b"Connection: close\r\n\r\n" + response_body
+            )
+            writer.write(response)
+            await writer.drain()
+        except Exception:
+            pass
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+
+    try:
+        server = await asyncio.start_server(handle_client, "0.0.0.0", port)
+        logger.info(f"Health check web server running on port {port}")
+        return server
+    except Exception as e:
+        logger.warning(f"Failed to start health check server on port {port}: {e}")
+        return None
+
+
+# ==========================================
+# R3: Rich Visual Progress Formatting
+# ==========================================
+
+def make_progress_bar(percentage: float, length: int = 12) -> str:
+    """Generate visual block progress bar: e.g. [████████░░░░] 65.0%"""
+    clamped_pct = max(0.0, min(100.0, float(percentage)))
+    filled_length = int(round(clamped_pct / 100.0 * length))
+    filled_length = max(0, min(length, filled_length))
+    bar = ("█" * filled_length) + ("░" * (length - filled_length))
+    return f"[{bar}] {clamped_pct:.1f}%"
+
+
+def format_size(size_bytes: Optional[Union[int, float]]) -> str:
+    """Format size in human-readable units (B, KB, MB, GB, TB)."""
+    if size_bytes is None or size_bytes < 0:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(size_bytes)
+    unit_idx = 0
+    while size >= 1024.0 and unit_idx < len(units) - 1:
+        size /= 1024.0
+        unit_idx += 1
+    if unit_idx == 0:
+        return f"{int(size)} B"
+    return f"{size:.2f} {units[unit_idx]}"
+
+
+def format_speed(speed_bytes_per_sec: Optional[Union[int, float]]) -> str:
+    """Format speed in human-readable units/sec (e.g. 4.2 MB/s)."""
+    if speed_bytes_per_sec is None or speed_bytes_per_sec <= 0:
+        return "0 B/s"
+    units = ["B/s", "KB/s", "MB/s", "GB/s"]
+    speed = float(speed_bytes_per_sec)
+    unit_idx = 0
+    while speed >= 1024.0 and unit_idx < len(units) - 1:
+        speed /= 1024.0
+        unit_idx += 1
+    if unit_idx == 0:
+        return f"{int(speed)} B/s"
+    return f"{speed:.1f} {units[unit_idx]}"
+
+
+def format_eta(seconds: Optional[Union[int, float]]) -> str:
+    """Format ETA in mm:ss format."""
+    if seconds is None or seconds < 0:
+        return "00:00"
+    total_seconds = int(seconds)
+    minutes = total_seconds // 60
+    sec = total_seconds % 60
+    return f"{minutes:02d}:{sec:02d}"
+
+
+def render_progress_text(action: str, current: int, total: int, speed: float, eta: float) -> str:
+    """Calculate and render rich progress status message text."""
+    total = max(total, 0)
+    current = max(current, 0)
+    pct = (current * 100.0 / total) if total > 0 else 0.0
+    bar = make_progress_bar(pct)
+    cur_str = format_size(current)
+    tot_str = format_size(total)
+    spd_str = format_speed(speed)
+    eta_str = format_eta(eta)
+
+    return (
+        f"__{action}__ : {bar}\n"
+        f"⚡ **Speed:** {spd_str} | ⏳ **ETA:** {eta_str}\n"
+        f"📦 **Size:** {cur_str} / {tot_str}"
+    )
+
+
+# ==========================================
+# R4: Interactive Task Cancellation & Tracking
+# ==========================================
+
+class TaskContext:
+    """Context holding state, files, and cancellation token for an active transfer task."""
+    def __init__(self, task_id: str, initiator_id: int, chat_id: int, smsg_id: Optional[int] = None):
+        self.task_id = task_id
+        self.initiator_id = initiator_id
+        self.chat_id = chat_id
+        self.smsg_id = smsg_id
+        self.smsg: Optional[Message] = None
+        self.async_task: Optional[asyncio.Task] = None
+        self.is_cancelled: bool = False
+        self.tracked_files: Set[str] = set()
+        self.start_time: float = time.time()
+
+    def track_file(self, path: Optional[str]):
+        if path:
+            self.tracked_files.add(os.path.abspath(path))
+
+    def cleanup_files(self):
+        for file_path in list(self.tracked_files):
+            remove_file(file_path)
+            self.tracked_files.discard(file_path)
+
+    def cancel(self):
+        self.is_cancelled = True
+        if self.async_task and not self.async_task.done():
+            self.async_task.cancel()
+        self.cleanup_files()
+
+
+ACTIVE_TASKS: Dict[str, TaskContext] = {}
+SMSG_TASK_MAP: Dict[Tuple[int, int], str] = {}
+
+
+def register_task(task_ctx: TaskContext):
+    ACTIVE_TASKS[task_ctx.task_id] = task_ctx
+    if task_ctx.smsg_id:
+        SMSG_TASK_MAP[(task_ctx.chat_id, task_ctx.smsg_id)] = task_ctx.task_id
+
+
+def unregister_task(task_id: str):
+    task_ctx = ACTIVE_TASKS.pop(task_id, None)
+    if task_ctx and task_ctx.smsg_id:
+        SMSG_TASK_MAP.pop((task_ctx.chat_id, task_ctx.smsg_id), None)
+
+
+def get_task(task_id: str) -> Optional[TaskContext]:
+    return ACTIVE_TASKS.get(task_id)
+
+
+def get_task_by_smsg(chat_id: int, smsg_id: int) -> Optional[TaskContext]:
+    task_id = SMSG_TASK_MAP.get((chat_id, smsg_id))
+    if task_id:
+        return ACTIVE_TASKS.get(task_id)
+    return None
+
+
+def is_task_cancelled(task_id: Optional[str]) -> bool:
+    if not task_id:
+        return False
+    ctx = ACTIVE_TASKS.get(task_id)
+    return ctx.is_cancelled if ctx else False
+
+
+def get_cancel_button(task_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ Cancel", callback_data=f"cancel_{task_id}")]
+    ])
+
+
+# In-memory status tracker to eliminate disk I/O during progress updates
+STATUS_TRACKER = {}
+
+
+def remove_file(path: Optional[str]):
+    if path is not None and os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        # Clean up any partial download temporary file
+        temp_path = path + ".temp"
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+async def delete_status_message(message: Message, smsg: Message):
+    try:
+        await bot.delete_messages(message.chat.id, [smsg.id])
+    except Exception:
         pass
 
 
-def downstatus(statusfile,message):
-    while True:
-        if os.path.exists(statusfile):
-            break
+async def delayed_delete_status(chat_id: int, smsg_id: int, delay: float = 2.0):
+    try:
+        await asyncio.sleep(delay)
+        await bot.delete_messages(chat_id, [smsg_id])
+    except Exception:
+        pass
 
-    time.sleep(3)
-    while os.path.exists(statusfile):
-        with open(statusfile,"r") as downread:
-            txt = downread.read()
+
+async def status_updater(key: Tuple[int, int, str], message: Message, action_title: str, task_id: Optional[str] = None):
+    """Periodically update Telegram status message with throttled progress edits (4-5s)."""
+    cancel_markup = get_cancel_button(task_id) if task_id else None
+    last_rendered_text = ""
+    try:
+        # Wait until initial progress data is received
+        while key not in STATUS_TRACKER:
+            await asyncio.sleep(0.3)
+
+        while key in STATUS_TRACKER:
+            data = STATUS_TRACKER.get(key)
+            if data:
+                text = render_progress_text(
+                    action_title,
+                    data.get("current", 0),
+                    data.get("total", 0),
+                    data.get("speed", 0.0),
+                    data.get("eta", 0.0),
+                )
+                if text != last_rendered_text:
+                    try:
+                        await bot.edit_message_text(
+                            message.chat.id,
+                            message.id,
+                            text,
+                            reply_markup=cancel_markup,
+                        )
+                        last_rendered_text = text
+                    except MessageNotModified:
+                        pass
+                    except MessageIdInvalid:
+                        break
+                    except Exception:
+                        pass
+            await asyncio.sleep(EDIT_THROTTLE_SECONDS)
+    except asyncio.CancelledError:
+        return
+
+
+async def downstatus(key, message, task_id: Optional[str] = None):
+    effective_task_id = task_id
+    if not effective_task_id:
+        task_ctx = get_task_by_smsg(message.chat.id, message.id)
+        if task_ctx:
+            effective_task_id = task_ctx.task_id
+    await status_updater(key, message, "Downloading", effective_task_id)
+
+
+async def upstatus(key, message, task_id: Optional[str] = None):
+    effective_task_id = task_id
+    if not effective_task_id:
+        task_ctx = get_task_by_smsg(message.chat.id, message.id)
+        if task_ctx:
+            effective_task_id = task_ctx.task_id
+    await status_updater(key, message, "Uploading", effective_task_id)
+
+
+def progress(current: int, total: int, smsg: Message, type_str: str, task_id: Optional[str] = None):
+    """Track download/upload progress keyed by the status message, checking for task cancellation."""
+    effective_task_id = task_id
+    if not effective_task_id:
+        task_ctx = get_task_by_smsg(smsg.chat.id, smsg.id)
+        if task_ctx:
+            effective_task_id = task_ctx.task_id
+
+    if effective_task_id and is_task_cancelled(effective_task_id):
+        raise pyrogram.StopTransmission("Task was cancelled by user.")
+
+    key = (smsg.chat.id, smsg.id, type_str)
+    now = time.time()
+
+    if key not in STATUS_TRACKER:
+        STATUS_TRACKER[key] = {
+            "start_time": now,
+            "last_time": now,
+            "current": current,
+            "total": total,
+            "speed": 0.0,
+            "eta": 0.0,
+            "task_id": effective_task_id,
+            "type": type_str,
+        }
+    else:
+        entry = STATUS_TRACKER[key]
+        elapsed = now - entry["start_time"]
+        speed = (current / elapsed) if elapsed > 0 else 0.0
+        remaining = max(0, total - current)
+        eta = (remaining / speed) if speed > 0 else 0.0
+
+        entry["current"] = current
+        entry["total"] = total
+        entry["speed"] = speed
+        entry["eta"] = eta
+        entry["last_time"] = now
+
+
+@bot.on_callback_query(filters.regex(r"^cancel_(.+)"))
+async def cancel_callback_handler(client: Client, callback_query: CallbackQuery):
+    """Handle interactive cancellation button click."""
+    data = callback_query.data or ""
+    task_id = data.split("cancel_", 1)[1] if "cancel_" in data else ""
+    task_ctx = get_task(task_id)
+
+    if not task_ctx:
+        await callback_query.answer("⚠️ Task has already completed or expired.", show_alert=False)
         try:
-            bot.edit_message_text(message.chat.id, message.id, f"__Downloaded__ : **{txt}**")
-            time.sleep(10)
-        except:
-            time.sleep(5)
+            await callback_query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    caller_id = callback_query.from_user.id if callback_query.from_user else None
+    if caller_id != task_ctx.initiator_id and caller_id not in owner_ids:
+        await callback_query.answer("⛔ You are not authorized to cancel this task.", show_alert=True)
+        return
+
+    # Cancel task, abort network transfers, clean up disk
+    task_ctx.cancel()
+    await callback_query.answer("❌ Task cancelled.", show_alert=False)
+
+    try:
+        await bot.edit_message_text(
+            task_ctx.chat_id,
+            task_ctx.smsg_id,
+            "❌ **Task Cancelled by user.**",
+            reply_markup=None,
+        )
+    except Exception:
+        pass
 
 
-def upstatus(statusfile,message):
-    while True:
-        if os.path.exists(statusfile):
-            break
-
-    time.sleep(3)
-    while os.path.exists(statusfile):
-        with open(statusfile,"r") as upread:
-            txt = upread.read()
-        try:
-            bot.edit_message_text(message.chat.id, message.id, f"__Uploaded__ : **{txt}**")
-            time.sleep(10)
-        except:
-            time.sleep(5)
-
-
-def progress(current, total, message, type):
-    with open(status_file(message, type),"w") as fileup:
-        fileup.write(f"{current * 100 / total:.1f}%")
-
-
-def is_owner(message):
+def is_owner(message: Message) -> bool:
     return message.from_user is not None and message.from_user.id in owner_ids
 
 
-def deny_access(message):
-    bot.send_message(message.chat.id, "**You are not authorized to use this bot.**", reply_to_message_id=message.id)
+async def deny_access(message: Message):
+    await bot.send_message(message.chat.id, "**You are not authorized to use this bot.**", reply_to_message_id=message.id)
 
 
 @bot.on_message(filters.command(["start"]))
-def send_start(client: pyrogram.client.Client, message: pyrogram.types.messages_and_media.message.Message):
+async def send_start(client: Client, message: Message):
     if not is_owner(message):
-        deny_access(message)
+        await deny_access(message)
         return
-    bot.send_message(message.chat.id, f"__👋 Hi **{message.from_user.mention}**, I am Save Restricted Bot, I can send you restricted content by it's post link__\n\n{USAGE}", reply_to_message_id=message.id)
+    await bot.send_message(
+        message.chat.id,
+        f"__👋 Hi **{message.from_user.mention}**, I am Save Restricted Bot, I can send you restricted content by it's post link__\n\n{USAGE}",
+        reply_to_message_id=message.id,
+    )
 
 
-def send_with_user_session(message, chatid, msgid, processed_media_groups):
+def get_readable_time(seconds: Union[int, float]) -> str:
+    """Format seconds into human-readable duration (e.g. 2d 4h 15m 30s)."""
+    seconds = max(0, int(seconds))
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, seconds = divmod(seconds, 60)
+    parts = []
+    if days > 0:
+        parts.append(f"{days}d")
+    if hours > 0 or days > 0:
+        parts.append(f"{hours}h")
+    if minutes > 0 or hours > 0 or days > 0:
+        parts.append(f"{minutes}m")
+    parts.append(f"{seconds}s")
+    return " ".join(parts)
+
+
+def get_system_stats() -> Dict[str, Any]:
+    """Collect system and process performance metrics."""
+    uptime = get_readable_time(time.time() - BOT_START_TIME)
+
+    try:
+        total_disk, used_disk, free_disk = shutil.disk_usage(".")
+        disk_str = f"{format_size(free_disk)} free / {format_size(total_disk)}"
+    except Exception:
+        disk_str = "N/A"
+
+    try:
+        import psutil
+        process = psutil.Process()
+        proc_mem = format_size(process.memory_info().rss)
+        sys_mem = psutil.virtual_memory()
+        mem_str = f"{proc_mem} (Bot) | {sys_mem.percent}% (System)"
+        cpu_pct = f"{psutil.cpu_percent(interval=None)}%"
+    except Exception:
+        mem_str = "N/A"
+        cpu_pct = "N/A"
+
+    return {
+        "uptime": uptime,
+        "active_tasks": len(ACTIVE_TASKS),
+        "disk": disk_str,
+        "memory": mem_str,
+        "cpu": cpu_pct,
+        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "pyrogram_version": getattr(pyrogram, "__version__", "unknown"),
+        "user_session": "Connected" if acc is not None else "Not Set",
+    }
+
+
+@bot.on_message(filters.command(["ping"]))
+async def ping_handler(client: Client, message: Message):
+    if not is_owner(message):
+        await deny_access(message)
+        return
+    start = time.time()
+    reply = await bot.send_message(message.chat.id, "🏓 **Pinging...**", reply_to_message_id=message.id)
+    latency_ms = (time.time() - start) * 1000.0
+    await bot.edit_message_text(
+        message.chat.id,
+        reply.id,
+        f"🏓 **Pong!**\n📶 **Latency:** `{latency_ms:.2f} ms`",
+    )
+
+
+@bot.on_message(filters.command(["stats", "status"]))
+async def stats_handler(client: Client, message: Message):
+    if not is_owner(message):
+        await deny_access(message)
+        return
+    stats = get_system_stats()
+    text = (
+        "📊 **Bot Diagnostics & System Stats**\n\n"
+        f"⏱️ **Uptime:** `{stats['uptime']}`\n"
+        f"🔄 **Active Tasks:** `{stats['active_tasks']}`\n"
+        f"🧠 **Memory:** `{stats['memory']}`\n"
+        f"⚡ **CPU Usage:** `{stats['cpu']}`\n"
+        f"💾 **Disk Space:** `{stats['disk']}`\n"
+        f"👤 **User Session:** `{stats['user_session']}`\n"
+        f"🐍 **Python:** `v{stats['python_version']}` | **Pyrogram:** `v{stats['pyrogram_version']}`"
+    )
+    await bot.send_message(message.chat.id, text, reply_to_message_id=message.id)
+
+
+@bot.on_message(filters.command(["setthumb"]))
+async def setthumb_handler(client: Client, message: Message):
+    if not is_owner(message):
+        await deny_access(message)
+        return
+    photo_msg = message.reply_to_message if message.reply_to_message and message.reply_to_message.photo else None
+    if not photo_msg and message.photo:
+        photo_msg = message
+    if not photo_msg:
+        await bot.send_message(
+            message.chat.id,
+            "⚠️ **Please reply to a photo with `/setthumb` to set your custom thumbnail.**",
+            reply_to_message_id=message.id,
+        )
+        return
+    downloaded = await bot.download_media(photo_msg)
+    if downloaded:
+        set_user_thumb(message.from_user.id if message.from_user else 0, downloaded)
+        remove_file(downloaded)
+        await bot.send_message(message.chat.id, "✅ **Custom thumbnail saved successfully!**", reply_to_message_id=message.id)
+    else:
+        await bot.send_message(message.chat.id, "❌ **Failed to download thumbnail.**", reply_to_message_id=message.id)
+
+
+@bot.on_message(filters.command(["delthumb"]))
+async def delthumb_handler(client: Client, message: Message):
+    if not is_owner(message):
+        await deny_access(message)
+        return
+    user_id = message.from_user.id if message.from_user else 0
+    if del_user_thumb(user_id):
+        await bot.send_message(message.chat.id, "🗑️ **Custom thumbnail deleted.**", reply_to_message_id=message.id)
+    else:
+        await bot.send_message(message.chat.id, "ℹ️ **No custom thumbnail was found to delete.**", reply_to_message_id=message.id)
+
+
+@bot.on_message(filters.command(["showthumb", "viewthumb"]))
+async def showthumb_handler(client: Client, message: Message):
+    if not is_owner(message):
+        await deny_access(message)
+        return
+    user_id = message.from_user.id if message.from_user else 0
+    thumb = get_user_thumb(user_id)
+    if thumb:
+        await bot.send_photo(message.chat.id, thumb, caption="🖼️ **Your Current Custom Thumbnail**", reply_to_message_id=message.id)
+    else:
+        await bot.send_message(message.chat.id, "ℹ️ **You do not have a custom thumbnail set.**", reply_to_message_id=message.id)
+
+
+@bot.on_message(filters.command(["setcaption"]))
+async def setcaption_handler(client: Client, message: Message):
+    if not is_owner(message):
+        await deny_access(message)
+        return
+    parts = message.text.split(None, 1)
+    if len(parts) < 2:
+        await bot.send_message(
+            message.chat.id,
+            "⚠️ **Usage:** `/setcaption <template>`\n\n"
+            "Supported variables:\n"
+            "• `{caption}` - Original post caption\n"
+            "• `{filename}` - File name\n\n"
+            "Example:\n`/setcaption 📁 {filename}\n\n{caption}\n\nSaved by MyBot`",
+            reply_to_message_id=message.id,
+        )
+        return
+    template = parts[1].strip()
+    user_id = message.from_user.id if message.from_user else 0
+    set_user_caption_template(user_id, template)
+    await bot.send_message(message.chat.id, "✅ **Custom caption template updated!**", reply_to_message_id=message.id)
+
+
+@bot.on_message(filters.command(["delcaption"]))
+async def delcaption_handler(client: Client, message: Message):
+    if not is_owner(message):
+        await deny_access(message)
+        return
+    user_id = message.from_user.id if message.from_user else 0
+    if del_user_caption_template(user_id):
+        await bot.send_message(message.chat.id, "🗑️ **Custom caption template deleted.**", reply_to_message_id=message.id)
+    else:
+        await bot.send_message(message.chat.id, "ℹ️ **No custom caption template was set.**", reply_to_message_id=message.id)
+
+
+@bot.on_message(filters.command(["showcaption", "viewcaption"]))
+async def showcaption_handler(client: Client, message: Message):
+    if not is_owner(message):
+        await deny_access(message)
+        return
+    user_id = message.from_user.id if message.from_user else 0
+    template = get_user_caption_template(user_id)
+    if template:
+        await bot.send_message(message.chat.id, f"📝 **Your Active Caption Template:**\n\n`{template}`", reply_to_message_id=message.id)
+    else:
+        await bot.send_message(message.chat.id, "ℹ️ **No custom caption template set. Using original captions.**", reply_to_message_id=message.id)
+
+
+async def send_with_user_session(message: Message, chatid: Union[int, str], msgid: int, processed_media_groups: set):
     if acc is None:
-        bot.send_message(message.chat.id,f"**String Session is not Set**", reply_to_message_id=message.id)
+        await bot.send_message(message.chat.id, f"**String Session is not Set**", reply_to_message_id=message.id)
         return
-    handle_private(message,chatid,msgid,processed_media_groups)
+    await handle_private(message, chatid, msgid, processed_media_groups)
 
 
-def parse_tme_link(text):
+def parse_tme_link(text: str) -> Optional[Dict[str, Any]]:
     link = text.strip()
 
     invite_match = re.match(r"^https://t\.me/(?:\+|joinchat/)[^/\s]+/?$", link)
     if invite_match:
         return {"type": "invite", "link": link}
 
-    match = re.match(r"^https://t\.me/(c|b)/([^/?#\s]+)/([0-9\s]+(?:-[0-9\s]+)?)(?:\?single)?$", link)
+    # Private channel with topic/thread: https://t.me/c/CHAT_ID/TOPIC_ID/MSG_RANGE
+    match = re.match(r"^https://t\.me/c/([^/?#\s]+)/[^/?#\s]+/([0-9\s]+(?:-[0-9\s]+)?)(?:\?single)?$", link)
     if match:
-        link_type, target, message_range = match.groups()
+        chat_id, message_range = match.groups()
         parsed_range = parse_message_range(message_range)
         if parsed_range is None:
             return None
         from_id, to_id = parsed_range
-        if link_type == "c":
-            return {"type": "private", "chatid": int("-100" + target), "from_id": from_id, "to_id": to_id}
+        return {"type": "private", "chatid": int("-100" + chat_id), "from_id": from_id, "to_id": to_id}
+
+    # Private channel without topic: https://t.me/c/CHAT_ID/MSG_RANGE
+    match = re.match(r"^https://t\.me/c/([^/?#\s]+)/([0-9\s]+(?:-[0-9\s]+)?)(?:\?single)?$", link)
+    if match:
+        chat_id, message_range = match.groups()
+        parsed_range = parse_message_range(message_range)
+        if parsed_range is None:
+            return None
+        from_id, to_id = parsed_range
+        return {"type": "private", "chatid": int("-100" + chat_id), "from_id": from_id, "to_id": to_id}
+
+    # Bot chat: https://t.me/b/BOTNAME/MSG_RANGE
+    match = re.match(r"^https://t\.me/b/([^/?#\s]+)/([0-9\s]+(?:-[0-9\s]+)?)(?:\?single)?$", link)
+    if match:
+        target, message_range = match.groups()
+        parsed_range = parse_message_range(message_range)
+        if parsed_range is None:
+            return None
+        from_id, to_id = parsed_range
         return {"type": "bot", "chatid": target, "from_id": from_id, "to_id": to_id}
 
+    # Public channel with topic/thread: https://t.me/CHANNEL/TOPIC_ID/MSG_RANGE
+    match = re.match(r"^https://t\.me/([^/?#\s]+)/[^/?#\s]+/([0-9\s]+(?:-[0-9\s]+)?)(?:\?single)?$", link)
+    if match:
+        username, message_range = match.groups()
+        parsed_range = parse_message_range(message_range)
+        if parsed_range is None:
+            return None
+        from_id, to_id = parsed_range
+        return {"type": "public", "chatid": username, "from_id": from_id, "to_id": to_id}
+
+    # Public channel without topic: https://t.me/CHANNEL/MSG_RANGE
     match = re.match(r"^https://t\.me/([^/?#\s]+)/([0-9\s]+(?:-[0-9\s]+)?)(?:\?single)?$", link)
     if match:
         username, message_range = match.groups()
@@ -136,7 +964,7 @@ def parse_tme_link(text):
     return None
 
 
-def parse_message_range(message_range):
+def parse_message_range(message_range: str) -> Optional[Tuple[int, int]]:
     parts = [part.strip() for part in message_range.split("-", 1)]
     try:
         from_id = int(parts[0])
@@ -146,96 +974,147 @@ def parse_message_range(message_range):
     return from_id, to_id
 
 
+async def process_single_message(message: Message, parsed_link: Dict[str, Any], msgid: int, processed_media_groups: set):
+    """Process a single message from a range concurrently."""
+    async with concurrency_sem:
+        chatid = parsed_link["chatid"]
+
+        if parsed_link["type"] in ("private", "bot"):
+            try:
+                await send_with_user_session(message, chatid, msgid, processed_media_groups)
+            except (asyncio.CancelledError, pyrogram.StopTransmission):
+                return
+            except Exception as e:
+                await bot.send_message(message.chat.id, f"**Error** : __{e}__", reply_to_message_id=message.id)
+        else:
+            try:
+                msg = await bot.get_messages(chatid, msgid)
+            except UsernameNotOccupied:
+                await bot.send_message(message.chat.id, "**The username is not occupied by anyone**", reply_to_message_id=message.id)
+                return
+            except Exception:
+                # Channel may be private or restricted for the bot; fall back to user session
+                try:
+                    await send_with_user_session(message, chatid, msgid, processed_media_groups)
+                except (asyncio.CancelledError, pyrogram.StopTransmission):
+                    return
+                except Exception as e:
+                    await bot.send_message(message.chat.id, f"**Error** : __{e}__", reply_to_message_id=message.id)
+                return
+            try:
+                if msg.empty:
+                    # Message is empty/deleted via bot API; fall back to user session
+                    await send_with_user_session(message, chatid, msgid, processed_media_groups)
+                    return
+                if getattr(msg, "media_group_id", None):
+                    media_group_key = (msg.chat.id, msg.media_group_id)
+                    if media_group_key in processed_media_groups:
+                        return
+                    try:
+                        await bot.copy_media_group(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
+                        processed_media_groups.add(media_group_key)
+                    except ValueError:
+                        await bot.copy_message(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
+                else:
+                    await bot.copy_message(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
+            except (asyncio.CancelledError, pyrogram.StopTransmission):
+                return
+            except Exception:
+                try:
+                    await send_with_user_session(message, msg.chat.id, msgid, processed_media_groups)
+                except (asyncio.CancelledError, pyrogram.StopTransmission):
+                    return
+                except Exception as e:
+                    await bot.send_message(message.chat.id, f"**Error** : __{e}__", reply_to_message_id=message.id)
+
+
 @bot.on_message(filters.text)
-def save(client: pyrogram.client.Client, message: pyrogram.types.messages_and_media.message.Message):
+async def save(client: Client, message: Message):
     if not is_owner(message):
-        deny_access(message)
+        await deny_access(message)
         return
 
     parsed_link = parse_tme_link(message.text)
     if parsed_link is None:
-        bot.send_message(message.chat.id,"**Invalid Link**", reply_to_message_id=message.id)
+        await bot.send_message(message.chat.id, "**Invalid Link**", reply_to_message_id=message.id)
         return
 
     if parsed_link["type"] == "invite":
         if acc is None:
-            bot.send_message(message.chat.id,"**String Session is not Set**", reply_to_message_id=message.id)
+            await bot.send_message(message.chat.id, "**String Session is not Set**", reply_to_message_id=message.id)
             return
 
         try:
-            acc.join_chat(parsed_link["link"])
-            bot.send_message(message.chat.id,"**Chat Joined**", reply_to_message_id=message.id)
+            async with acc_lock:
+                await acc.join_chat(parsed_link["link"])
+            await bot.send_message(message.chat.id, "**Chat Joined**", reply_to_message_id=message.id)
         except UserAlreadyParticipant:
-            bot.send_message(message.chat.id,"**Chat alredy Joined**", reply_to_message_id=message.id)
+            await bot.send_message(message.chat.id, "**Chat already Joined**", reply_to_message_id=message.id)
         except InviteHashExpired:
-            bot.send_message(message.chat.id,"**Invalid Link**", reply_to_message_id=message.id)
+            await bot.send_message(message.chat.id, "**Invalid Link**", reply_to_message_id=message.id)
         except Exception as e:
-            bot.send_message(message.chat.id,f"**Error** : __{e}__", reply_to_message_id=message.id)
+            await bot.send_message(message.chat.id, f"**Error** : __{e}__", reply_to_message_id=message.id)
         return
 
     from_id = parsed_link["from_id"]
     to_id = parsed_link["to_id"]
     if to_id < from_id:
-        bot.send_message(message.chat.id,"**Invalid Range**", reply_to_message_id=message.id)
+        await bot.send_message(message.chat.id, "**Invalid Range**", reply_to_message_id=message.id)
         return
     if to_id - from_id + 1 > MAX_MESSAGE_RANGE:
-        bot.send_message(message.chat.id,f"**Range is too large. Maximum {MAX_MESSAGE_RANGE} messages allowed.**", reply_to_message_id=message.id)
+        await bot.send_message(
+            message.chat.id,
+            f"**Range is too large. Maximum {MAX_MESSAGE_RANGE} messages allowed.**",
+            reply_to_message_id=message.id,
+        )
         return
 
     processed_media_groups = set()
 
-    for msgid in range(from_id, to_id+1):
-        chatid = parsed_link["chatid"]
+    # Process messages concurrently in parallel tasks
+    tasks = []
+    for msgid in range(from_id, to_id + 1):
+        tasks.append(process_single_message(message, parsed_link, msgid, processed_media_groups))
 
-        if parsed_link["type"] in ("private", "bot"):
-            try: send_with_user_session(message,chatid,msgid,processed_media_groups)
-            except Exception as e: bot.send_message(message.chat.id,f"**Error** : __{e}__", reply_to_message_id=message.id)
-        else:
-            try: msg = bot.get_messages(chatid,msgid)
-            except UsernameNotOccupied:
-                bot.send_message(message.chat.id,"**The username is not occupied by anyone**", reply_to_message_id=message.id)
-                return
-            try:
-                if getattr(msg, "media_group_id", None):
-                    media_group_key = (msg.chat.id, msg.media_group_id)
-                    if media_group_key in processed_media_groups:
-                        continue
-                    try:
-                        bot.copy_media_group(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
-                        processed_media_groups.add(media_group_key)
-                    except ValueError:
-                        bot.copy_message(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
-                else:
-                    bot.copy_message(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
-            except Exception:
-                try: send_with_user_session(message,msg.chat.id,msgid,processed_media_groups)
-                except Exception as e: bot.send_message(message.chat.id,f"**Error** : __{e}__", reply_to_message_id=message.id)
+    batch_start = time.time()
+    await asyncio.gather(*tasks, return_exceptions=True)
 
-        time.sleep(3)
+    if to_id > from_id:
+        elapsed = time.time() - batch_start
+        total_msgs = to_id - from_id + 1
+        await bot.send_message(
+            message.chat.id,
+            f"✅ **Batch Completed:** Processed `{total_msgs}` messages in `{elapsed:.1f}s`.",
+            reply_to_message_id=message.id,
+        )
 
 
 @bot.on_message(filters.incoming & filters.media)
-def save_media(client: pyrogram.client.Client, message: pyrogram.types.messages_and_media.message.Message):
+async def save_media(client: Client, message: Message):
     if not is_owner(message):
-        deny_access(message)
+        await deny_access(message)
         return
 
     try:
         if message.media_group_id:
-            # Telegram delivers each album item as a separate update.
-            time.sleep(1)
-            media_group = bot.get_media_group(message.chat.id, message.id)
+            await asyncio.sleep(1)
+            media_group = await bot.get_media_group(message.chat.id, message.id)
             if message.id != media_group[0].id:
                 return
-            bot.copy_media_group(message.chat.id, message.chat.id, message.id, reply_to_message_id=message.id)
+            await bot.copy_media_group(message.chat.id, message.chat.id, message.id, reply_to_message_id=message.id)
         else:
-            bot.copy_message(message.chat.id, message.chat.id, message.id, reply_to_message_id=message.id)
+            await bot.copy_message(message.chat.id, message.chat.id, message.id, reply_to_message_id=message.id)
     except Exception as e:
-        bot.send_message(message.chat.id, f"**Error** : __{e}__", reply_to_message_id=message.id)
+        await bot.send_message(message.chat.id, f"**Error** : __{e}__", reply_to_message_id=message.id)
 
 
-def handle_private(message: pyrogram.types.messages_and_media.message.Message, chatid: int, msgid: int, processed_media_groups=None):
-    msg: pyrogram.types.messages_and_media.message.Message = acc.get_messages(chatid,msgid)
+async def handle_private(message: Message, chatid: Union[int, str], msgid: int, processed_media_groups: Optional[set] = None):
+    async with acc_lock:
+        msg = await acc.get_messages(chatid, msgid)
+
+    if msg is None or msg.empty:
+        return
+
     media_group_id = getattr(msg, "media_group_id", None)
 
     if media_group_id:
@@ -243,137 +1122,360 @@ def handle_private(message: pyrogram.types.messages_and_media.message.Message, c
         if processed_media_groups is not None and media_group_key in processed_media_groups:
             return
         try:
-            messages = acc.get_media_group(chatid,msgid)
+            async with acc_lock:
+                messages = await acc.get_media_group(chatid, msgid)
         except ValueError:
             messages = [msg]
         if processed_media_groups is not None:
             processed_media_groups.add(media_group_key)
         if len(messages) > 1:
-            handle_private_media_group(message,messages)
+            await handle_private_media_group(message, messages)
             return
 
-    handle_private_message(message,msg)
+    await handle_private_message(message, msg)
 
 
-def handle_private_message(message: pyrogram.types.messages_and_media.message.Message, msg: pyrogram.types.messages_and_media.message.Message):
+async def handle_private_message(message: Message, msg: Message):
     msg_type = get_message_type(msg)
 
     if "Text" == msg_type:
-        bot.send_message(message.chat.id, msg.text, entities=msg.entities, reply_to_message_id=message.id)
+        await bot.send_message(message.chat.id, msg.text, entities=msg.entities, reply_to_message_id=message.id)
         return
     if msg_type is None:
-        bot.send_message(message.chat.id, "**Unsupported Message Type**", reply_to_message_id=message.id)
+        await bot.send_message(message.chat.id, "**Unsupported Message Type**", reply_to_message_id=message.id)
         return
 
-    down_status_file = status_file(message, "down")
-    up_status_file = status_file(message, "up")
-    smsg = bot.send_message(message.chat.id, '__Downloading__', reply_to_message_id=message.id)
-    dosta = threading.Thread(target=lambda:downstatus(down_status_file,smsg),daemon=True)
-    dosta.start()
+    is_oversized, file_size = check_file_size_limit(msg)
+    if is_oversized:
+        size_str = format_size(file_size)
+        await bot.send_message(
+            message.chat.id,
+            f"⚠️ **File Too Large:** `{size_str}`\nTelegram limits bot uploads to **2 GB**. This file exceeds the upload limit.",
+            reply_to_message_id=message.id,
+        )
+        return
+
+    user_id = message.from_user.id if message.from_user else 0
+    custom_thumb = get_user_thumb(user_id)
+
+    task_id = uuid.uuid4().hex[:10]
+    task_ctx = TaskContext(
+        task_id=task_id,
+        initiator_id=user_id,
+        chat_id=message.chat.id,
+    )
+    task_ctx.async_task = asyncio.current_task()
+    register_task(task_ctx)
+
+    cancel_markup = get_cancel_button(task_id)
+    smsg = await bot.send_message(
+        message.chat.id,
+        '__Downloading__',
+        reply_to_message_id=message.id,
+        reply_markup=cancel_markup,
+    )
+    task_ctx.smsg_id = smsg.id
+    task_ctx.smsg = smsg
+    register_task(task_ctx)
+
+    # Key progress by the unique status message to avoid collisions across concurrent downloads
+    down_key = (smsg.chat.id, smsg.id, "down")
+    up_key = (smsg.chat.id, smsg.id, "up")
+
+    down_task = asyncio.create_task(downstatus(down_key, smsg, task_id))
+    up_task = None
     file = None
     thumb = None
 
     try:
-        file = acc.download_media(msg, progress=progress, progress_args=[message,"down"])
-        remove_file(down_status_file)
+        # download_media runs with max_concurrent_transmissions=10 connections
+        file = await acc.download_media(msg, progress=progress, progress_args=[smsg, "down", task_id])
+        if task_ctx.is_cancelled or file is None:
+            return
+        task_ctx.track_file(file)
 
-        upsta = threading.Thread(target=lambda:upstatus(up_status_file,smsg),daemon=True)
-        upsta.start()
+        STATUS_TRACKER.pop(down_key, None)
+        if down_task and not down_task.done():
+            down_task.cancel()
+
+        if task_ctx.is_cancelled:
+            return
+
+        await bot.edit_message_text(message.chat.id, smsg.id, "__Uploading__", reply_markup=cancel_markup)
+        up_task = asyncio.create_task(upstatus(up_key, smsg, task_id))
 
         if "Document" == msg_type:
-            try:
-                thumb = acc.download_media(msg.document.thumbs[0].file_id)
-            except: thumb = None
+            doc_name = getattr(msg.document, "file_name", None) or os.path.basename(file)
+            caption = apply_caption_template(user_id, msg.caption, doc_name)
+            thumb = custom_thumb
+            if not thumb:
+                try:
+                    if msg.document.thumbs:
+                        thumb = await acc.download_media(msg.document.thumbs[0].file_id)
+                        task_ctx.track_file(thumb)
+                except Exception:
+                    thumb = None
 
-            bot.send_document(message.chat.id, file, thumb=thumb, caption=msg.caption, caption_entities=msg.caption_entities, reply_to_message_id=message.id, progress=progress, progress_args=[message,"up"])
+            if task_ctx.is_cancelled:
+                return
+            await bot.send_document(
+                message.chat.id,
+                file,
+                thumb=thumb,
+                caption=caption,
+                caption_entities=msg.caption_entities if caption == msg.caption else None,
+                reply_to_message_id=message.id,
+                progress=progress,
+                progress_args=[smsg, "up", task_id],
+            )
 
         elif "Video" == msg_type:
-            try:
-                thumb = acc.download_media(msg.video.thumbs[0].file_id)
-            except: thumb = None
+            vid_name = getattr(msg.video, "file_name", None) or os.path.basename(file)
+            caption = apply_caption_template(user_id, msg.caption, vid_name)
+            thumb = custom_thumb
+            if not thumb:
+                try:
+                    if msg.video.thumbs:
+                        thumb = await acc.download_media(msg.video.thumbs[0].file_id)
+                        task_ctx.track_file(thumb)
+                except Exception:
+                    thumb = None
+            if not thumb and file:
+                generated_thumb = generate_video_thumbnail(file)
+                if generated_thumb:
+                    thumb = generated_thumb
+                    task_ctx.track_file(thumb)
 
-            bot.send_video(message.chat.id, file, duration=msg.video.duration, width=msg.video.width, height=msg.video.height, thumb=thumb, caption=msg.caption, caption_entities=msg.caption_entities, reply_to_message_id=message.id, progress=progress, progress_args=[message,"up"])
+            if task_ctx.is_cancelled:
+                return
+            await bot.send_video(
+                message.chat.id,
+                file,
+                duration=msg.video.duration or 0,
+                width=msg.video.width or 0,
+                height=msg.video.height or 0,
+                thumb=thumb,
+                caption=caption,
+                caption_entities=msg.caption_entities if caption == msg.caption else None,
+                reply_to_message_id=message.id,
+                progress=progress,
+                progress_args=[smsg, "up", task_id],
+            )
 
         elif "Animation" == msg_type:
-            bot.send_animation(message.chat.id, file, reply_to_message_id=message.id)
+            if task_ctx.is_cancelled:
+                return
+            await bot.send_animation(message.chat.id, file, reply_to_message_id=message.id)
 
         elif "Sticker" == msg_type:
-            bot.send_sticker(message.chat.id, file, reply_to_message_id=message.id)
+            if task_ctx.is_cancelled:
+                return
+            await bot.send_sticker(message.chat.id, file, reply_to_message_id=message.id)
 
         elif "Voice" == msg_type:
-            bot.send_voice(message.chat.id, file, caption=msg.caption, caption_entities=msg.caption_entities, reply_to_message_id=message.id, progress=progress, progress_args=[message,"up"])
+            caption = apply_caption_template(user_id, msg.caption)
+            if task_ctx.is_cancelled:
+                return
+            await bot.send_voice(
+                message.chat.id,
+                file,
+                caption=caption,
+                caption_entities=msg.caption_entities if caption == msg.caption else None,
+                reply_to_message_id=message.id,
+                progress=progress,
+                progress_args=[smsg, "up", task_id],
+            )
 
         elif "Audio" == msg_type:
-            try:
-                thumb = acc.download_media(msg.audio.thumbs[0].file_id)
-            except: thumb = None
+            audio_name = getattr(msg.audio, "file_name", None) or os.path.basename(file)
+            caption = apply_caption_template(user_id, msg.caption, audio_name)
+            thumb = custom_thumb
+            if not thumb:
+                try:
+                    if msg.audio.thumbs:
+                        thumb = await acc.download_media(msg.audio.thumbs[0].file_id)
+                        task_ctx.track_file(thumb)
+                except Exception:
+                    thumb = None
 
-            bot.send_audio(message.chat.id, file, caption=msg.caption, caption_entities=msg.caption_entities, reply_to_message_id=message.id, progress=progress, progress_args=[message,"up"])
+            if task_ctx.is_cancelled:
+                return
+            await bot.send_audio(
+                message.chat.id,
+                file,
+                caption=caption,
+                caption_entities=msg.caption_entities if caption == msg.caption else None,
+                reply_to_message_id=message.id,
+                progress=progress,
+                progress_args=[smsg, "up", task_id],
+            )
 
         elif "Photo" == msg_type:
-            bot.send_photo(message.chat.id, file, caption=msg.caption, caption_entities=msg.caption_entities, reply_to_message_id=message.id)
+            if task_ctx.is_cancelled:
+                return
+            await bot.send_photo(
+                message.chat.id,
+                file,
+                caption=msg.caption,
+                caption_entities=msg.caption_entities,
+                reply_to_message_id=message.id,
+            )
+
+    except (asyncio.CancelledError, pyrogram.StopTransmission):
+        logger.info(f"Task {task_id} was cancelled cleanly.")
+        return
     finally:
+        STATUS_TRACKER.pop(down_key, None)
+        STATUS_TRACKER.pop(up_key, None)
+        if down_task and not down_task.done():
+            down_task.cancel()
+        if up_task and not up_task.done():
+            up_task.cancel()
+        task_ctx.cleanup_files()
         remove_file(thumb)
         remove_file(file)
-        remove_file(down_status_file)
-        remove_file(up_status_file)
-        delete_status_message(message, smsg)
+        unregister_task(task_id)
+        if task_ctx.is_cancelled:
+            asyncio.create_task(delayed_delete_status(message.chat.id, smsg.id, delay=2.0))
+        else:
+            await delete_status_message(message, smsg)
 
 
-def handle_private_media_group(message: pyrogram.types.messages_and_media.message.Message, messages):
-    down_status_file = status_file(message, "down")
-    smsg = bot.send_message(message.chat.id, '__Downloading__', reply_to_message_id=message.id)
-    dosta = threading.Thread(target=lambda:downstatus(down_status_file,smsg),daemon=True)
-    dosta.start()
+async def handle_private_media_group(message: Message, messages: List[Message]):
+    task_id = uuid.uuid4().hex[:10]
+    task_ctx = TaskContext(
+        task_id=task_id,
+        initiator_id=message.from_user.id if message.from_user else 0,
+        chat_id=message.chat.id,
+    )
+    task_ctx.async_task = asyncio.current_task()
+    register_task(task_ctx)
+
+    cancel_markup = get_cancel_button(task_id)
+    smsg = await bot.send_message(
+        message.chat.id,
+        '__Downloading__',
+        reply_to_message_id=message.id,
+        reply_markup=cancel_markup,
+    )
+    task_ctx.smsg_id = smsg.id
+    task_ctx.smsg = smsg
+    register_task(task_ctx)
+
+    down_key = (smsg.chat.id, smsg.id, "down")
+    down_task = asyncio.create_task(downstatus(down_key, smsg, task_id))
     files = []
     thumbs = []
     media = []
 
     try:
         for msg in messages:
+            if task_ctx.is_cancelled:
+                return
+
             msg_type = get_message_type(msg)
             if msg_type not in ("Photo", "Video", "Document", "Audio"):
                 raise ValueError(f"Message type {msg_type} can't be sent in a media group.")
 
-            file = acc.download_media(msg, progress=progress, progress_args=[message,"down"])
+            file = await acc.download_media(msg, progress=progress, progress_args=[smsg, "down", task_id])
+            if task_ctx.is_cancelled or file is None:
+                return
             files.append(file)
-            caption = msg.caption or ""
-            caption_entities = msg.caption_entities
+            task_ctx.track_file(file)
+
+            user_id = message.from_user.id if message.from_user else 0
+            raw_caption = msg.caption or ""
+            caption = apply_caption_template(user_id, raw_caption) or ""
+            caption_entities = msg.caption_entities if caption == raw_caption else None
 
             if "Photo" == msg_type:
                 media.append(InputMediaPhoto(file, caption=caption, caption_entities=caption_entities))
             elif "Video" == msg_type:
+                thumb = None
                 try:
-                    thumb = acc.download_media(msg.video.thumbs[0].file_id)
-                except: thumb = None
-                thumbs.append(thumb)
-                media.append(InputMediaVideo(file, thumb=thumb, caption=caption, caption_entities=caption_entities, duration=msg.video.duration or 0, width=msg.video.width or 0, height=msg.video.height or 0))
+                    if msg.video.thumbs:
+                        thumb = await acc.download_media(msg.video.thumbs[0].file_id)
+                        task_ctx.track_file(thumb)
+                except Exception:
+                    thumb = None
+                if thumb:
+                    thumbs.append(thumb)
+                media.append(InputMediaVideo(
+                    file,
+                    thumb=thumb,
+                    caption=caption,
+                    caption_entities=caption_entities,
+                    duration=msg.video.duration or 0,
+                    width=msg.video.width or 0,
+                    height=msg.video.height or 0,
+                ))
             elif "Document" == msg_type:
+                thumb = None
                 try:
-                    thumb = acc.download_media(msg.document.thumbs[0].file_id)
-                except: thumb = None
-                thumbs.append(thumb)
+                    if msg.document.thumbs:
+                        thumb = await acc.download_media(msg.document.thumbs[0].file_id)
+                        task_ctx.track_file(thumb)
+                except Exception:
+                    thumb = None
+                if thumb:
+                    thumbs.append(thumb)
                 media.append(InputMediaDocument(file, thumb=thumb, caption=caption, caption_entities=caption_entities))
             elif "Audio" == msg_type:
+                thumb = None
                 try:
-                    thumb = acc.download_media(msg.audio.thumbs[0].file_id)
-                except: thumb = None
-                thumbs.append(thumb)
-                media.append(InputMediaAudio(file, thumb=thumb, caption=caption, caption_entities=caption_entities, duration=msg.audio.duration or 0, performer=msg.audio.performer or "", title=msg.audio.title or ""))
+                    if msg.audio.thumbs:
+                        thumb = await acc.download_media(msg.audio.thumbs[0].file_id)
+                        task_ctx.track_file(thumb)
+                except Exception:
+                    thumb = None
+                if thumb:
+                    thumbs.append(thumb)
+                media.append(InputMediaAudio(
+                    file,
+                    thumb=thumb,
+                    caption=caption,
+                    caption_entities=caption_entities,
+                    duration=msg.audio.duration or 0,
+                    performer=msg.audio.performer or "",
+                    title=msg.audio.title or "",
+                ))
 
-        remove_file(down_status_file)
-        bot.edit_message_text(message.chat.id, smsg.id, "__Uploading__")
-        bot.send_media_group(message.chat.id, media, reply_to_message_id=message.id)
+        STATUS_TRACKER.pop(down_key, None)
+        if down_task and not down_task.done():
+            down_task.cancel()
+
+        if task_ctx.is_cancelled:
+            return
+
+        await bot.edit_message_text(message.chat.id, smsg.id, "__Uploading__", reply_markup=cancel_markup)
+
+        # Send media in chunks of MAX_MEDIA_GROUP_SIZE to respect Telegram's 10-item limit
+        for i in range(0, len(media), MAX_MEDIA_GROUP_SIZE):
+            if task_ctx.is_cancelled:
+                return
+            chunk = media[i:i + MAX_MEDIA_GROUP_SIZE]
+            await bot.send_media_group(message.chat.id, chunk, reply_to_message_id=message.id)
+
+    except (asyncio.CancelledError, pyrogram.StopTransmission):
+        logger.info(f"Media group task {task_id} was cancelled cleanly.")
+        return
     finally:
+        STATUS_TRACKER.pop(down_key, None)
+        if down_task and not down_task.done():
+            down_task.cancel()
+        task_ctx.cleanup_files()
         for thumb in thumbs:
             remove_file(thumb)
         for file in files:
             remove_file(file)
-        remove_file(down_status_file)
-        delete_status_message(message, smsg)
+        unregister_task(task_id)
+        if task_ctx.is_cancelled:
+            asyncio.create_task(delayed_delete_status(message.chat.id, smsg.id, delay=2.0))
+        else:
+            await delete_status_message(message, smsg)
 
 
-def get_message_type(msg: pyrogram.types.messages_and_media.message.Message):
+def get_message_type(msg: Message) -> Optional[str]:
     if msg.document:
         return "Document"
     if msg.video:
@@ -431,6 +1533,16 @@ https://t.me/b/botusername/4321
 
 These links also require a valid `STRING`.
 
+**Forum / topic messages**
+
+Use the topic format:
+
+```
+https://t.me/channelname/45/123
+
+https://t.me/c/123456789/45/123
+```
+
 **Multiple messages**
 
 Use `start_id-end_id` in the message ID position:
@@ -442,7 +1554,42 @@ https://t.me/c/123456789/101-120
 ```
 
 The bot processes up to 100 messages per request. Albums / media groups are sent as a group when possible.
+
+**Custom Thumbnails & Captions**
+- `/setthumb`: Reply to any image to set as your default thumbnail
+- `/delthumb`: Delete your custom thumbnail
+- `/showthumb`: View your current active thumbnail
+- `/setcaption <template>`: Set custom caption with `{caption}` and `{filename}`
+- `/delcaption`: Remove custom caption template
+- `/showcaption`: View active caption template
+
+**Diagnostics & Info**
+- `/ping`: Check bot response latency
+- `/stats` or `/status`: View bot uptime, CPU, RAM, disk space, and active tasks
 """
 
 
-bot.run()
+async def main():
+    web_server = None
+    port_env = os.getenv("PORT")
+    if port_env:
+        try:
+            web_server = await start_web_server(int(port_env))
+        except (ValueError, OSError) as e:
+            logger.warning(f"Could not start web server on port {port_env}: {e}")
+
+    if acc is not None:
+        await acc.start()
+    await bot.start()
+    print("Bot is running...")
+    await idle()
+    await bot.stop()
+    if acc is not None:
+        await acc.stop()
+    if web_server:
+        web_server.close()
+        await web_server.wait_closed()
+
+
+if __name__ == "__main__":
+    bot.run(main())

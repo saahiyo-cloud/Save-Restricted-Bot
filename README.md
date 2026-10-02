@@ -117,3 +117,27 @@ https://t.me/c/123456789/101-120
 ```
 
 The bot processes up to 100 messages per request. Albums / media groups are sent as a group when possible.
+
+## Diagnostics & System Stats
+
+- `/ping`: Measure Telegram Bot response latency.
+- `/stats` or `/status`: View real-time system metrics:
+  - Bot uptime
+  - Active download/upload tasks
+  - Memory (Bot RSS and system percentage)
+  - CPU usage
+  - Disk storage (free / total space)
+  - User session status
+  - Python and Pyrogram versions
+
+## Custom Thumbnails & Captions
+
+- `/setthumb`: Reply to any photo to set it as your custom thumbnail for documents and videos.
+- `/delthumb`: Delete your saved custom thumbnail.
+- `/showthumb` or `/viewthumb`: View your current active thumbnail.
+- `/setcaption <template>`: Set a custom caption template. Supports variables `{caption}` and `{filename}`.
+  - *Example:* `/setcaption 📁 {filename}\n\n{caption}\n\nSaved via MyBot`
+- `/delcaption`: Remove your custom caption template.
+- `/showcaption`: View your active caption template.
+
+
