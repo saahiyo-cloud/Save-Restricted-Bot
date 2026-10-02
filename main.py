@@ -47,6 +47,36 @@ logger = logging.getLogger("SaveRestrictedBot")
 BOT_START_TIME = time.time()
 
 
+def sync_telegram_time_offset() -> float:
+    """Detect and compensate for system clock drift against Telegram servers to prevent MTProto msg_id errors."""
+    try:
+        import urllib.request
+        from email.utils import parsedate_to_datetime
+        res = urllib.request.urlopen("https://api.telegram.org", timeout=5)
+        server_date_str = res.headers.get("Date")
+        if server_date_str:
+            server_time = parsedate_to_datetime(server_date_str).timestamp()
+            local_time = time.time()
+            skew = server_time - local_time
+            if abs(skew) > 10:
+                logger.info(f"System clock drift detected ({skew:+.2f}s). Synchronizing MTProto MsgId offset.")
+                import pyrogram.session.internals.msg_id as msg_id_mod
+                def patched_new(cls):
+                    now = int(time.time() + skew)
+                    cls.offset = (cls.offset + 4) if now == cls.last_time else 0
+                    msg_id = (now * 2 ** 32) + cls.offset
+                    cls.last_time = now
+                    return msg_id
+                msg_id_mod.MsgId.__new__ = patched_new
+                return skew
+    except Exception as e:
+        logger.debug(f"Clock synchronization skipped: {e}")
+    return 0.0
+
+
+sync_telegram_time_offset()
+
+
 # ==========================================
 # R2: Configuration Loading & Fallback Logic
 # ==========================================
