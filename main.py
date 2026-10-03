@@ -29,6 +29,7 @@ from pyrogram.errors import (
     FloodWait,
     MessageNotModified,
     MessageIdInvalid,
+    ChannelsTooMuch,
     RPCError,
 )
 from pyrogram.types import (
@@ -307,13 +308,17 @@ else:
 
 # Lock for user session RPC calls (get_messages, join_chat) to prevent concurrent socket reads
 acc_lock = asyncio.Lock()
-# Semaphore for processing multiple messages concurrently
-concurrency_sem = asyncio.Semaphore(5)
+# Semaphore for processing multiple messages concurrently (kept conservative to protect account against FloodWait)
+concurrency_sem = asyncio.Semaphore(3)
 
 MAX_MESSAGE_RANGE = 100
 MAX_MEDIA_GROUP_SIZE = 10
 EDIT_THROTTLE_SECONDS = 1.8
 MAX_BOT_FILE_SIZE = 2000 * 1024 * 1024  # 2 GB Telegram Bot API upload limit
+
+# Anti-flood controls for chat joins
+LAST_JOIN_TIME = 0.0
+JOIN_COOLDOWN_SECONDS = 10.0
 
 THUMB_DIR = Path("downloads/thumbnails")
 CAPTION_DIR = Path("downloads/captions")
@@ -1677,8 +1682,16 @@ def parse_message_range(message_range: str) -> Optional[Tuple[int, int]]:
     return from_id, to_id
 
 
-async def process_single_message(message: Message, parsed_link: Dict[str, Any], msgid: int, processed_media_groups: set):
-    """Process a single message from a range concurrently."""
+async def process_single_message(
+    message: Message,
+    parsed_link: Dict[str, Any],
+    msgid: int,
+    processed_media_groups: set,
+    delay: float = 0.0,
+):
+    """Process a single message from a range concurrently with anti-burst throttling."""
+    if delay > 0:
+        await asyncio.sleep(delay)
     async with concurrency_sem:
         chatid = parsed_link["chatid"]
 
@@ -1755,9 +1768,16 @@ async def save(client: Client, message: Message):
             )
             return
 
+        global LAST_JOIN_TIME
+        now = time.time()
+        elapsed = now - LAST_JOIN_TIME
+        if elapsed < JOIN_COOLDOWN_SECONDS:
+            await asyncio.sleep(JOIN_COOLDOWN_SECONDS - elapsed)
+
         try:
             async with acc_lock:
                 await acc.join_chat(parsed_link["link"])
+            LAST_JOIN_TIME = time.time()
             await bot.send_message(
                 message.chat.id,
                 "✅ **Joined Chat**: Successfully joined! You can now send post links from this channel.",
@@ -1767,6 +1787,12 @@ async def save(client: Client, message: Message):
             await bot.send_message(
                 message.chat.id,
                 "ℹ️ **Already Joined**: You are already a member of this chat. Ready to fetch posts!",
+                reply_to_message_id=message.id,
+            )
+        except ChannelsTooMuch:
+            await bot.send_message(
+                message.chat.id,
+                "⚠️ **Telegram Channel Limit Reached**: The user account has reached Telegram's maximum channel limit (500 channels). Please leave inactive channels.",
                 reply_to_message_id=message.id,
             )
         except InviteHashExpired:
@@ -1802,10 +1828,10 @@ async def save(client: Client, message: Message):
 
     processed_media_groups = set()
 
-    # Process messages concurrently in parallel tasks
+    # Process messages concurrently in parallel tasks with staggered dispatch
     tasks = []
-    for msgid in range(from_id, to_id + 1):
-        tasks.append(process_single_message(message, parsed_link, msgid, processed_media_groups))
+    for idx, msgid in enumerate(range(from_id, to_id + 1)):
+        tasks.append(process_single_message(message, parsed_link, msgid, processed_media_groups, delay=idx * 0.35))
 
     batch_start = time.time()
     await asyncio.gather(*tasks, return_exceptions=True)
