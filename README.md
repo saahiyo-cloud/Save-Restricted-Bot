@@ -84,6 +84,36 @@ Stop the container:
 docker compose down
 ```
 
+### 4. Deploy on InstaCloud (24/7 Cloud Hosting)
+
+This repository includes native [InstaCloud](https://instacloud.io) support for zero-config 24/7 worker deployment.
+
+1. **Install Insta CLI & Login**:
+   ```bash
+   npm install -g @instacloud/cli
+   insta login
+   ```
+
+2. **Set Environment Secrets**:
+   Bind your credentials into the compute environment:
+   ```bash
+   insta secrets set TOKEN="your_bot_token"
+   insta secrets set ID="your_api_id"
+   insta secrets set HASH="your_api_hash"
+   insta secrets set STRING="your_session_string"
+   insta secrets set OWNER_ID="123456789,987654321"
+   ```
+
+3. **Deploy Service**:
+   ```bash
+   insta deploy
+   ```
+
+4. **Monitor Logs**:
+   ```bash
+   insta logs -s bot -f
+   ```
+
 ---
 
 ## Usage Guide
