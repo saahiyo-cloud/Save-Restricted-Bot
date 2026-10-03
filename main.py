@@ -14,6 +14,8 @@ import uuid
 import logging
 import functools
 import shutil
+import sqlite3
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, Set, Dict, Any, Union, Tuple, List
 
@@ -418,6 +420,168 @@ def del_user_custom_msg(user_id: int) -> bool:
         except Exception:
             pass
     return False
+
+
+# ==========================================
+# User Activity & Usage Analytics (SQLite)
+# ==========================================
+
+ANALYTICS_DB_PATH = Path("downloads/analytics.db")
+
+
+def init_analytics_db():
+    """Initialize SQLite tables for user profiles and file transfer activity tracking."""
+    ANALYTICS_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(ANALYTICS_DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
+                first_seen REAL,
+                last_seen REAL,
+                total_files INTEGER DEFAULT 0,
+                total_bytes INTEGER DEFAULT 0,
+                total_requests INTEGER DEFAULT 0
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS transfer_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                file_name TEXT,
+                file_size INTEGER,
+                msg_type TEXT,
+                timestamp REAL
+            )
+        """)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_transfers_user ON transfer_logs (user_id)")
+        conn.commit()
+
+
+# Ensure database tables exist
+init_analytics_db()
+
+
+def record_user_activity(user_id: int, username: Optional[str] = None, first_name: Optional[str] = None):
+    """Update user last seen timestamp, username, and increment total request interactions."""
+    if not user_id:
+        return
+    now = time.time()
+    try:
+        with sqlite3.connect(ANALYTICS_DB_PATH, timeout=10.0) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO users (user_id, username, first_name, first_seen, last_seen, total_requests)
+                VALUES (?, ?, ?, ?, ?, 1)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    username = COALESCE(?, username),
+                    first_name = COALESCE(?, first_name),
+                    last_seen = ?,
+                    total_requests = total_requests + 1
+            """, (user_id, username, first_name, now, now, username, first_name, now))
+            conn.commit()
+    except Exception as e:
+        logger.debug(f"Could not record user activity for {user_id}: {e}")
+
+
+def record_user_transfer(user_id: int, file_name: str, file_size: int, msg_type: str):
+    """Log a completed file transfer and update user aggregate transfer metrics."""
+    if not user_id:
+        return
+    now = time.time()
+    size = max(0, int(file_size or 0))
+    try:
+        with sqlite3.connect(ANALYTICS_DB_PATH, timeout=10.0) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO users (user_id, first_seen, last_seen, total_files, total_bytes)
+                VALUES (?, ?, ?, 1, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    last_seen = ?,
+                    total_files = total_files + 1,
+                    total_bytes = total_bytes + ?
+            """, (user_id, now, now, size, now, size))
+            cursor.execute("""
+                INSERT INTO transfer_logs (user_id, file_name, file_size, msg_type, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+            """, (user_id, file_name[:200], size, msg_type[:30], now))
+            conn.commit()
+    except Exception as e:
+        logger.debug(f"Could not record transfer for {user_id}: {e}")
+
+
+def get_all_users_analytics() -> List[Dict[str, Any]]:
+    """Retrieve summarized analytics for all known users, sorted by total bytes transferred descending."""
+    try:
+        with sqlite3.connect(ANALYTICS_DB_PATH, timeout=10.0) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT user_id, username, first_name, first_seen, last_seen, total_files, total_bytes, total_requests
+                FROM users
+                ORDER BY total_bytes DESC, last_seen DESC
+            """)
+            return [dict(row) for row in cursor.fetchall()]
+    except Exception as e:
+        logger.error(f"Error reading users analytics: {e}")
+        return []
+
+
+def get_user_analytics(user_id: int) -> Optional[Dict[str, Any]]:
+    """Retrieve detailed analytics for a specific user, including breakdown by media type."""
+    try:
+        with sqlite3.connect(ANALYTICS_DB_PATH, timeout=10.0) as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+            user_row = cursor.fetchone()
+            if not user_row:
+                return None
+            user_dict = dict(user_row)
+
+            # Breakdown by media type
+            cursor.execute("""
+                SELECT msg_type, COUNT(*) as cnt, SUM(file_size) as total_size
+                FROM transfer_logs
+                WHERE user_id = ?
+                GROUP BY msg_type
+            """, (user_id,))
+            breakdown = {row["msg_type"]: {"count": row["cnt"], "size": row["total_size"]} for row in cursor.fetchall()}
+            user_dict["breakdown"] = breakdown
+
+            # Recent transfers
+            cursor.execute("""
+                SELECT file_name, file_size, msg_type, timestamp
+                FROM transfer_logs
+                WHERE user_id = ?
+                ORDER BY timestamp DESC
+                LIMIT 5
+            """, (user_id,))
+            user_dict["recent"] = [dict(row) for row in cursor.fetchall()]
+            return user_dict
+    except Exception as e:
+        logger.error(f"Error reading user analytics for {user_id}: {e}")
+        return None
+
+
+def get_global_analytics_summary() -> Dict[str, Any]:
+    """Retrieve overall system-wide user count and transfer totals."""
+    try:
+        with sqlite3.connect(ANALYTICS_DB_PATH, timeout=10.0) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*), SUM(total_files), SUM(total_bytes), SUM(total_requests) FROM users")
+            row = cursor.fetchone()
+            return {
+                "total_users": row[0] or 0,
+                "total_files": row[1] or 0,
+                "total_bytes": row[2] or 0,
+                "total_requests": row[3] or 0,
+            }
+    except Exception as e:
+        logger.error(f"Error reading global analytics: {e}")
+        return {"total_users": 0, "total_files": 0, "total_bytes": 0, "total_requests": 0}
 
 
 # ==========================================
@@ -1323,6 +1487,10 @@ def build_commands_text() -> str:
         "⏳ **Auto-Delete (Self-Destruct)**\n"
         "• `/setautodel <duration>` - Set self-destruct timer (e.g. `15m`, `30m`, `1h` or `off`)\n"
         "• `/showautodel` - View active self-destruct duration\n\n"
+        "👥 **User & Usage Analytics**\n"
+        "• `/users` - View all active users and total bandwidth (Owner)\n"
+        "• `/user <id>` - In-depth breakdown for a specific user ID (Owner)\n"
+        "• `/myusage` - View your personal downloaded files and bandwidth\n\n"
         "📊 **Diagnostics & Help**\n"
         "• `/ping` - Test network response latency\n"
         "• `/stats` or `/status` - Bot diagnostics, RAM & CPU\n"
@@ -1440,6 +1608,8 @@ async def send_start(client: Client, message: Message):
     if not is_owner(message):
         await deny_access(message)
         return
+    user_id = message.from_user.id if message.from_user else 0
+    record_user_activity(user_id, getattr(message.from_user, "username", None), getattr(message.from_user, "first_name", None))
     mention = message.from_user.mention if message.from_user else "User"
     await bot.send_message(
         message.chat.id,
@@ -1454,6 +1624,8 @@ async def help_handler(client: Client, message: Message):
     if not is_owner(message):
         await deny_access(message)
         return
+    user_id = message.from_user.id if message.from_user else 0
+    record_user_activity(user_id, getattr(message.from_user, "username", None), getattr(message.from_user, "first_name", None))
     await bot.send_message(
         message.chat.id,
         build_guide_text(),
@@ -1792,6 +1964,170 @@ async def showautodel_handler(client: Client, message: Message):
         )
 
 
+# ==========================================
+# User Analytics & Usage Commands
+# ==========================================
+
+@bot.on_message(filters.command(["users", "stats_users"]))
+async def users_analytics_handler(client: Client, message: Message):
+    """Owner command: View overall usage statistics and list active users."""
+    if not is_owner(message):
+        await deny_access(message)
+        return
+    user_id = message.from_user.id if message.from_user else 0
+    record_user_activity(user_id, getattr(message.from_user, "username", None), getattr(message.from_user, "first_name", None))
+
+    users = get_all_users_analytics()
+    summary = get_global_analytics_summary()
+
+    if not users:
+        await bot.send_message(
+            message.chat.id,
+            "👥 **No user activity recorded yet.**",
+            reply_to_message_id=message.id,
+        )
+        return
+
+    text_lines = [
+        "👥 **User Usage & Analytics Overview**\n",
+        f"📊 **Total Tracked Users:** `{summary['total_users']}`",
+        f"📦 **Total Transferred Files:** `{summary['total_files']}`",
+        f"🌐 **Total Network Traffic:** `{format_size(summary['total_bytes'])}`",
+        f"⚡ **Total Interactions:** `{summary['total_requests']}`\n",
+        "**Top Users by Bandwidth:**",
+    ]
+
+    for idx, u in enumerate(users[:15], start=1):
+        name = u['first_name'] or u['username'] or f"User {u['user_id']}"
+        uname_str = f" (@{u['username']})" if u['username'] else ""
+        size_str = format_size(u['total_bytes'])
+        files_cnt = u['total_files']
+        last_seen = int(time.time() - u['last_seen'])
+        ago_str = get_readable_time(last_seen) + " ago" if last_seen > 10 else "Just now"
+
+        text_lines.append(
+            f"**{idx}.** `{u['user_id']}` • **{name}**{uname_str}\n"
+            f"    └ 📦 `{files_cnt}` files | 📊 `{size_str}` | ⏱ `{ago_str}`"
+        )
+
+    text_lines.append("\n💡 _Use `/user <id>` to inspect detailed breakdown for a specific user._")
+    await bot.send_message(
+        message.chat.id,
+        "\n".join(text_lines),
+        reply_to_message_id=message.id,
+    )
+
+
+@bot.on_message(filters.command(["user", "userstats"]))
+async def user_detail_handler(client: Client, message: Message):
+    """Owner command: View in-depth breakdown of a specific user ID."""
+    if not is_owner(message):
+        await deny_access(message)
+        return
+    parts = message.text.split(None, 1)
+    if len(parts) < 2:
+        await bot.send_message(
+            message.chat.id,
+            "⚠️ **Usage:** `/user <user_id>`\n\nExample: `/user 123456789`",
+            reply_to_message_id=message.id,
+        )
+        return
+
+    try:
+        target_id = int(parts[1].strip())
+    except ValueError:
+        await bot.send_message(message.chat.id, "⚠️ Invalid user ID. Please provide a numeric ID.", reply_to_message_id=message.id)
+        return
+
+    analytics = get_user_analytics(target_id)
+    if not analytics:
+        await bot.send_message(message.chat.id, f"⚠️ No data found for user ID `{target_id}`.", reply_to_message_id=message.id)
+        return
+
+    name = analytics['first_name'] or "Unknown"
+    uname = f"@{analytics['username']}" if analytics['username'] else "None"
+    first_dt = datetime.fromtimestamp(analytics['first_seen']).strftime("%Y-%m-%d %H:%M") if analytics['first_seen'] else "Unknown"
+    last_dt = datetime.fromtimestamp(analytics['last_seen']).strftime("%Y-%m-%d %H:%M") if analytics['last_seen'] else "Unknown"
+    autodel = get_user_autodelete_delay(target_id)
+    autodel_str = get_readable_time(autodel) if autodel > 0 else "Off"
+
+    lines = [
+        f"👤 **User Profile: {name}** (`{target_id}`)\n",
+        f"• **Username:** {uname}",
+        f"• **First Seen:** `{first_dt}`",
+        f"• **Last Active:** `{last_dt}`",
+        f"• **Self-Destruct Timer:** `{autodel_str}`\n",
+        f"📦 **Total Saved Files:** `{analytics['total_files']}`",
+        f"📊 **Total Bandwidth:** `{format_size(analytics['total_bytes'])}`",
+        f"⚡ **Commands / Requests:** `{analytics['total_requests']}`\n",
+        "📁 **Breakdown by Media Type:**",
+    ]
+
+    breakdown = analytics.get("breakdown", {})
+    if breakdown:
+        for m_type, b_info in breakdown.items():
+            lines.append(f"  • **{m_type}:** `{b_info['count']}` files ({format_size(b_info['size'])})")
+    else:
+        lines.append("  • _No completed transfers logged yet._")
+
+    recent = analytics.get("recent", [])
+    if recent:
+        lines.append("\n🕒 **Recent Transfers:**")
+        for r in recent:
+            dt_str = datetime.fromtimestamp(r['timestamp']).strftime("%m-%d %H:%M")
+            lines.append(f"  • `{r['file_name'][:30]}` ({format_size(r['file_size'])}) - {dt_str}")
+
+    await bot.send_message(
+        message.chat.id,
+        "\n".join(lines),
+        reply_to_message_id=message.id,
+    )
+
+
+@bot.on_message(filters.command(["myusage", "me"]))
+async def myusage_handler(client: Client, message: Message):
+    """User command: Check their own personal usage statistics."""
+    if not is_owner(message):
+        await deny_access(message)
+        return
+    user_id = message.from_user.id if message.from_user else 0
+    record_user_activity(user_id, getattr(message.from_user, "username", None), getattr(message.from_user, "first_name", None))
+
+    analytics = get_user_analytics(user_id)
+    if not analytics or analytics.get("total_files", 0) == 0:
+        await bot.send_message(
+            message.chat.id,
+            "📊 **Your Usage Statistics**\n\n"
+            "You haven't downloaded any files through the bot yet.\n"
+            "Send a post link to begin saving media!",
+            reply_to_message_id=message.id,
+        )
+        return
+
+    autodel = get_user_autodelete_delay(user_id)
+    autodel_str = get_readable_time(autodel) if autodel > 0 else "Off"
+    name = message.from_user.first_name if message.from_user else "User"
+
+    lines = [
+        f"📊 **Personal Usage Statistics for {name}**\n",
+        f"📦 **Total Files Saved:** `{analytics['total_files']}`",
+        f"🌐 **Data Transferred:** `{format_size(analytics['total_bytes'])}`",
+        f"⚡ **Requests Handled:** `{analytics['total_requests']}`",
+        f"⏳ **Active Auto-Delete:** `{autodel_str}`\n",
+        "📁 **Media Breakdown:**",
+    ]
+
+    breakdown = analytics.get("breakdown", {})
+    for m_type, b_info in breakdown.items():
+        lines.append(f"  • **{m_type}:** `{b_info['count']}` files ({format_size(b_info['size'])})")
+
+    await bot.send_message(
+        message.chat.id,
+        "\n".join(lines),
+        reply_to_message_id=message.id,
+    )
+
+
 async def send_with_user_session(message: Message, chatid: Union[int, str], msgid: int, processed_media_groups: set):
     if acc is None:
         await bot.send_message(message.chat.id, f"**String Session is not Set**", reply_to_message_id=message.id)
@@ -1940,6 +2276,9 @@ async def process_single_message(
                     except Exception:
                         pass
                     await schedule_media_deletion(message.chat.id, del_ids, autodel_delay)
+
+                if copied_res:
+                    record_user_transfer(user_id, f"Direct Copy ({msgid})", 0, "Direct Copy")
             except (asyncio.CancelledError, pyrogram.StopTransmission):
                 return
             except Exception:
@@ -2821,6 +3160,8 @@ async def save(client: Client, message: Message):
     if not is_owner(message):
         await deny_access(message)
         return
+    user_id = message.from_user.id if message.from_user else 0
+    record_user_activity(user_id, getattr(message.from_user, "username", None), getattr(message.from_user, "first_name", None))
 
     # Check if this message is a reply to an active batch review card
     if message.reply_to_message and message.reply_to_message.id in BATCH_MSG_MAP:
@@ -3363,6 +3704,9 @@ async def handle_private_message(message: Message, msg: Message):
             if media_ids_to_del:
                 await schedule_media_deletion(message.chat.id, media_ids_to_del, autodel_delay)
 
+        # Log analytics transfer
+        record_user_transfer(user_id, file_display_name, file_size, msg_type)
+
     except (asyncio.CancelledError, pyrogram.StopTransmission):
         logger.info(f"Task {task_id} was cancelled cleanly.")
         return
@@ -3586,6 +3930,9 @@ async def handle_private_media_group(message: Message, messages: List[Message]):
                 sent_group_ids.append(completion_msg.id)
             if sent_group_ids:
                 await schedule_media_deletion(message.chat.id, sent_group_ids, autodel_delay)
+
+        # Log analytics transfer for media group
+        record_user_transfer(user_id, f"Album ({len(files)} items)", total_size, "Media Group")
 
     except (asyncio.CancelledError, pyrogram.StopTransmission):
         logger.info(f"Media group task {task_id} was cancelled cleanly.")

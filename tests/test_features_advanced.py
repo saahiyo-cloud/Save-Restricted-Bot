@@ -369,3 +369,34 @@ async def test_schedule_media_deletion_task():
             mock_sleep.assert_called_with(900)
             mock_del.assert_called_with(12345, [101, 102])
 
+
+def test_user_analytics_tracking(tmp_path):
+    from main import (
+        record_user_activity,
+        record_user_transfer,
+        get_all_users_analytics,
+        get_user_analytics,
+        get_global_analytics_summary,
+    )
+    test_uid = 55443322
+    record_user_activity(test_uid, "alice_test", "Alice")
+    record_user_transfer(test_uid, "video.mp4", 1024 * 1024 * 50, "Video")
+    record_user_transfer(test_uid, "doc.pdf", 1024 * 1024 * 5, "Document")
+
+    profile = get_user_analytics(test_uid)
+    assert profile is not None
+    assert profile["user_id"] == test_uid
+    assert profile["username"] == "alice_test"
+    assert profile["total_files"] >= 2
+    assert profile["total_bytes"] >= (55 * 1024 * 1024)
+    assert "Video" in profile["breakdown"]
+    assert "Document" in profile["breakdown"]
+
+    all_users = get_all_users_analytics()
+    assert any(u["user_id"] == test_uid for u in all_users)
+
+    summary = get_global_analytics_summary()
+    assert summary["total_users"] >= 1
+    assert summary["total_files"] >= 2
+
+

@@ -14,6 +14,7 @@
 - **Completion Summary Cards**: Separate clean cards detailing completed file transfers, file sizes, and download/upload elapsed duration.
 - **Custom Thumbnails & Captions**: Personalize your uploaded documents and videos with custom thumbnails and caption templates (`{filename}`, `{caption}`).
 - **Self-Destruct / Auto-Delete Media**: Automatically deletes delivered media messages and completion cards after a customizable timer (defaults to **15 minutes**) with an advisory notice to preserve chat privacy and storage.
+- **User Activity & Usage Analytics**: Built-in SQLite telemetry tracking user requests, files transferred, total network bandwidth, and media type breakdowns via `/users`, `/user <id>`, and `/myusage`.
 - **Anti-Ban Protections**: Intelligent batch pacing, rate-limit backoffs, and invite-link cooldowns to protect user sessions from FloodWait.
 - **System Diagnostics**: Built-in `/ping`, `/stats`, and `/status` monitoring CPU, RAM, disk, active tasks, and session health.
 
@@ -177,6 +178,9 @@ https://t.me/c/123456789/101-120
 | `/showcaption` | View your active custom caption template |
 | `/setautodel <time>` | Configure self-destruct timer for loaded media (e.g. `15m`, `30m`, `1h`, or `off`) |
 | `/showautodel` | View your active self-destruct timer (defaults to 15 minutes) |
+| `/users` | View all active users, total downloaded files, and bandwidth consumption (Owner) |
+| `/user <id>` | View in-depth breakdown for a specific user ID with media breakdown (Owner) |
+| `/myusage` | View your personal transferred files and total data usage |
 | `/cancel` | Cancel an ongoing batch download in progress |
 
 ---
