@@ -123,7 +123,7 @@ def test_64bit_channel_peer_resolution():
     assert utils.get_peer_type(-123456789) == "chat"
 
     # User ID
-    assert utils.get_peer_type(7240138588) == "user"
+    assert utils.get_peer_type(9876543210) == "user"
 
     # Invalid ID
     with pytest.raises(ValueError):
