@@ -91,3 +91,185 @@ async def test_botmedia_handler_help_text():
             mock_send.assert_called_once()
             assert "Usage:" in mock_send.call_args[0][1]
 
+
+def test_parse_selection_indices():
+    from main import parse_selection_indices
+    assert parse_selection_indices("1-5", 10) == [0, 1, 2, 3, 4]
+    assert parse_selection_indices("2, 4, 6", 10) == [1, 3, 5]
+    assert parse_selection_indices("5-2", 10) == [1, 2, 3, 4]
+    assert parse_selection_indices("1-3, 7, 9", 10) == [0, 1, 2, 6, 8]
+    assert parse_selection_indices("50", 10) == []
+    assert parse_selection_indices("", 10) == []
+    assert parse_selection_indices("invalid", 10) == []
+
+
+def test_media_classification():
+    from main import is_video_message, is_doc_message, is_photo_message, get_media_item_icon
+
+    vid_msg = MagicMock()
+    vid_msg.video = MagicMock()
+    vid_msg.document = None
+    vid_msg.photo = None
+    assert is_video_message(vid_msg) is True
+    assert is_doc_message(vid_msg) is False
+    assert get_media_item_icon(vid_msg) == "🎬"
+
+    doc_vid_msg = MagicMock()
+    doc_vid_msg.video = None
+    doc_vid_msg.document = MagicMock()
+    doc_vid_msg.document.mime_type = "video/mp4"
+    doc_vid_msg.document.file_name = "movie.mkv"
+    doc_vid_msg.photo = None
+    assert is_video_message(doc_vid_msg) is True
+    assert is_doc_message(doc_vid_msg) is False
+
+    doc_msg = MagicMock()
+    doc_msg.video = None
+    doc_msg.document = MagicMock()
+    doc_msg.document.mime_type = "application/pdf"
+    doc_msg.document.file_name = "notes.pdf"
+    doc_msg.photo = None
+    assert is_video_message(doc_msg) is False
+    assert is_doc_message(doc_msg) is True
+    assert get_media_item_icon(doc_msg) == "📄"
+
+    photo_msg = MagicMock()
+    photo_msg.video = None
+    photo_msg.document = None
+    photo_msg.photo = MagicMock()
+    assert is_photo_message(photo_msg) is True
+    assert is_video_message(photo_msg) is False
+    assert is_doc_message(photo_msg) is False
+    assert get_media_item_icon(photo_msg) == "🖼️"
+
+
+def test_build_batch_preview_and_keyboard():
+    from main import build_batch_preview_text, build_batch_keyboard
+
+    m1 = MagicMock()
+    m1.video = MagicMock()
+    m1.document = None
+    m1.photo = None
+    m1.video.file_name = "Ep1.mp4"
+    m1.video.file_size = 500 * 1024 * 1024
+
+    m2 = MagicMock()
+    m2.video = None
+    m2.document = None
+    m2.photo = MagicMock()
+
+    messages = [m1, m2]
+    preview_text = build_batch_preview_text("TestBot", messages)
+    assert "Batch Received from @TestBot" in preview_text
+    assert "🎬 **Videos:** 1" in preview_text
+    assert "🖼️ **Photos (banners/ads):** 1" in preview_text
+
+    kb = build_batch_keyboard("batch123", messages)
+    button_texts = [btn.text for row in kb.inline_keyboard for btn in row]
+    assert any("Videos Only (1)" in t for t in button_texts)
+    assert any("Download All (2)" in t for t in button_texts)
+    assert any("Cancel" in t for t in button_texts)
+
+
+@pytest.mark.asyncio
+async def test_batch_download_callback_handler_filter_videos():
+    import time
+    from main import (
+        batch_download_callback_handler,
+        PENDING_BOT_BATCHES,
+        BATCH_MSG_MAP,
+    )
+    owner_id = list(owner_ids)[0] if owner_ids else 12345
+
+    m_vid = MagicMock()
+    m_vid.video = MagicMock()
+    m_vid.document = None
+    m_vid.photo = None
+
+    m_photo = MagicMock()
+    m_photo.video = None
+    m_photo.document = None
+    m_photo.photo = MagicMock()
+
+    batch_id = "test_b1"
+    trigger_msg = MagicMock()
+    trigger_msg.chat.id = 1001
+    trigger_msg.id = 2001
+
+    PENDING_BOT_BATCHES[batch_id] = {
+        "batch_id": batch_id,
+        "user_id": owner_id,
+        "chat_id": 1001,
+        "bot_username": "TestBot",
+        "messages": [m_photo, m_vid],
+        "status_msg_id": 999,
+        "trigger_message": trigger_msg,
+        "created_at": time.time(),
+    }
+    BATCH_MSG_MAP[999] = batch_id
+
+    query = MagicMock()
+    query.data = f"b_dl:{batch_id}:videos"
+    query.from_user.id = owner_id
+    query.answer = AsyncMock()
+    query.edit_message_text = AsyncMock()
+
+    with patch("main.download_selected_batch", new_callable=AsyncMock) as mock_download:
+        await batch_download_callback_handler(MagicMock(), query)
+
+        query.answer.assert_called_once()
+        assert "Starting 1 downloads" in query.answer.call_args[0][0]
+        # Batch should be popped from pending dict
+        assert batch_id not in PENDING_BOT_BATCHES
+        assert 999 not in BATCH_MSG_MAP
+        # download_selected_batch is called with only the video message (photo excluded!)
+        mock_download.assert_called_once_with(trigger_msg, [m_vid], 999)
+
+
+@pytest.mark.asyncio
+async def test_save_reply_to_batch_range():
+    import time
+    from main import save, PENDING_BOT_BATCHES, BATCH_MSG_MAP
+    owner_id = list(owner_ids)[0] if owner_ids else 12345
+
+    m1 = MagicMock()
+    m2 = MagicMock()
+    m3 = MagicMock()
+
+    batch_id = "test_b2"
+    trigger_msg = MagicMock()
+    trigger_msg.chat.id = 1001
+    trigger_msg.id = 2001
+
+    PENDING_BOT_BATCHES[batch_id] = {
+        "batch_id": batch_id,
+        "user_id": owner_id,
+        "chat_id": 1001,
+        "bot_username": "TestBot",
+        "messages": [m1, m2, m3],
+        "status_msg_id": 888,
+        "trigger_message": trigger_msg,
+        "created_at": time.time(),
+    }
+    BATCH_MSG_MAP[888] = batch_id
+
+    reply_msg = MagicMock()
+    reply_msg.chat.id = 1001
+    reply_msg.id = 3001
+    reply_msg.text = "2-3"
+    reply_msg.from_user.id = owner_id
+    reply_msg.reply_to_message = MagicMock()
+    reply_msg.reply_to_message.id = 888
+
+    with patch("main.owner_ids", {owner_id}):
+        with patch("main.bot.send_message", new_callable=AsyncMock) as mock_send, \
+             patch("main.download_selected_batch", new_callable=AsyncMock) as mock_download:
+            mock_send.return_value = MagicMock(id=9999)
+            await save(MagicMock(), reply_msg)
+
+            assert batch_id not in PENDING_BOT_BATCHES
+            assert 888 not in BATCH_MSG_MAP
+            mock_download.assert_called_once_with(reply_msg, [m2, m3], 9999)
+
+
+

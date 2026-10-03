@@ -1203,10 +1203,13 @@ def build_guide_text() -> str:
         "`https://t.me/channelname/100-110`\n"
         "`https://t.me/c/123456789/100-110`\n"
         "_(Processes up to 100 posts per request)_\n\n"
-        "**5. Bot File Stores & Batches**\n"
+        "**5. Bot File Stores & Selective Batches**\n"
         "Send the bot start link directly:\n"
         "`https://t.me/botname?start=batch_xyz`\n"
-        "Or use `/botmedia @botname [count]` to fetch recent media!"
+        "• Interactive filter card with breakdown of videos & ads\n"
+        "• Tap **🎬 Videos Only** to skip promotional banners/ads!\n"
+        "• Reply with numbers (e.g. `2-10` or `2,4,6`) to download specific items\n"
+        "• Or use `/botmedia @botname [count]` to fetch recent media!"
     )
 
 
@@ -1222,9 +1225,11 @@ def build_guide_keyboard() -> InlineKeyboardMarkup:
 def build_commands_text() -> str:
     return (
         "⚙️ **Available Commands & Settings**\n\n"
-        "🤖 **Bot File Stores**\n"
-        "• `/botmedia @bot [count]` - Fetch media sent by a bot\n"
-        "• Or send `https://t.me/bot?start=param` link directly\n\n"
+        "🤖 **Bot File Stores & Batches**\n"
+        "• Send `https://t.me/bot?start=param` link directly\n"
+        "• Filter buttons: **Videos Only**, **Docs & Videos**, **All**\n"
+        "• Reply to batch preview with range (`2-10`) or list (`1,3,5`)\n"
+        "• `/botmedia @bot [count] [filter]` - Fetch recent media\n\n"
         "🖼️ **Thumbnails**\n"
         "• `/setthumb` - Reply to an image to set as thumbnail\n"
         "• `/showthumb` - View your active thumbnail\n"
@@ -1757,6 +1762,254 @@ async def process_single_message(
                     await bot.send_message(message.chat.id, f"**Error** : __{e}__", reply_to_message_id=message.id)
 
 
+PENDING_BOT_BATCHES: Dict[str, Dict[str, Any]] = {}
+BATCH_MSG_MAP: Dict[int, str] = {}
+
+
+def cleanup_expired_batches():
+    """Remove batch selection states older than 30 minutes."""
+    now = time.time()
+    expired = [k for k, v in list(PENDING_BOT_BATCHES.items()) if now - v.get("created_at", 0) > 1800]
+    for k in expired:
+        batch = PENDING_BOT_BATCHES.pop(k, None)
+        if batch and "status_msg_id" in batch:
+            BATCH_MSG_MAP.pop(batch["status_msg_id"], None)
+
+
+def is_video_message(msg: Message) -> bool:
+    """Determine if message contains a video or video document."""
+    if getattr(msg, "video", None) is not None:
+        return True
+    if getattr(msg, "document", None) is not None:
+        doc = msg.document
+        mime = (getattr(doc, "mime_type", None) or "").lower()
+        file_name = (getattr(doc, "file_name", None) or "").lower()
+        if mime.startswith("video/") or file_name.endswith(
+            (".mp4", ".mkv", ".avi", ".mov", ".flv", ".webm", ".ts", ".m4v", ".wmv", ".3gp")
+        ):
+            return True
+    return False
+
+
+def is_doc_message(msg: Message) -> bool:
+    """Determine if message contains a non-video document."""
+    return getattr(msg, "document", None) is not None and not is_video_message(msg)
+
+
+def is_photo_message(msg: Message) -> bool:
+    """Determine if message contains a photo (commonly sponsor ads or banners)."""
+    return getattr(msg, "photo", None) is not None
+
+
+def get_media_item_icon(msg: Message) -> str:
+    """Return an appropriate emoji icon for a Telegram media message."""
+    if is_video_message(msg):
+        return "🎬"
+    if is_doc_message(msg):
+        return "📄"
+    if is_photo_message(msg):
+        return "🖼️"
+    if getattr(msg, "audio", None):
+        return "🎵"
+    if getattr(msg, "voice", None):
+        return "🎙️"
+    if getattr(msg, "animation", None):
+        return "🎞️"
+    return "📦"
+
+
+def parse_selection_indices(text: str, max_count: int) -> List[int]:
+    """Parse selection string like '1-5', '2,4,6', '1-3, 5, 8-10' into sorted 0-based unique indices."""
+    if not text:
+        return []
+    indices = set()
+    cleaned = text.replace(" ", "")
+    parts = [p for p in cleaned.split(",") if p]
+    for p in parts:
+        if "-" in p:
+            sub = p.split("-", 1)
+            try:
+                start, end = int(sub[0]), int(sub[1])
+                if start > end:
+                    start, end = end, start
+                for num in range(start, end + 1):
+                    if 1 <= num <= max_count:
+                        indices.add(num - 1)
+            except ValueError:
+                continue
+        else:
+            try:
+                num = int(p)
+                if 1 <= num <= max_count:
+                    indices.add(num - 1)
+            except ValueError:
+                continue
+    return sorted(list(indices))
+
+
+def build_batch_preview_text(bot_username: str, media_messages: List[Message], max_preview: int = 6) -> str:
+    """Generate an itemized breakdown and preview of incoming bot media."""
+    videos = [m for m in media_messages if is_video_message(m)]
+    docs = [m for m in media_messages if is_doc_message(m)]
+    photos = [m for m in media_messages if is_photo_message(m)]
+    others = [m for m in media_messages if not (is_video_message(m) or is_doc_message(m) or is_photo_message(m))]
+
+    preview_lines = []
+    for i, m in enumerate(media_messages[:max_preview], 1):
+        name, size, _ = extract_media_info(m)
+        icon = get_media_item_icon(m)
+        size_str = f" ({format_size(size)})" if size > 0 else ""
+
+        clean_name = name if len(name) <= 30 else (name[:27] + "...")
+        if is_photo_message(m):
+            clean_name += " [Banner/Ad]"
+        preview_lines.append(f"`{i}.` {icon} {clean_name}{size_str}")
+
+    preview_block = "\n".join(preview_lines)
+    remaining = len(media_messages) - max_preview
+    if remaining > 0:
+        preview_block += f"\n_... and {remaining} more items_"
+
+    breakdown = []
+    if videos:
+        breakdown.append(f"• 🎬 **Videos:** {len(videos)}")
+    if docs:
+        breakdown.append(f"• 📄 **Documents:** {len(docs)}")
+    if photos:
+        breakdown.append(f"• 🖼️ **Photos (banners/ads):** {len(photos)}")
+    if others:
+        breakdown.append(f"• 📦 **Other Media:** {len(others)}")
+
+    breakdown_str = "\n".join(breakdown)
+
+    return (
+        f"📦 **Batch Received from @{bot_username}**\n\n"
+        f"Total items found: **{len(media_messages)}**\n"
+        f"{breakdown_str}\n\n"
+        f"📋 **Preview:**\n"
+        f"{preview_block}\n\n"
+        f"👉 **Choose a filter below**, or reply to this message with item numbers (e.g. `2-10` or `2,4,6`):"
+    )
+
+
+def build_batch_keyboard(batch_id: str, media_messages: List[Message]) -> InlineKeyboardMarkup:
+    """Construct inline selection buttons for the batch review card."""
+    videos = [m for m in media_messages if is_video_message(m)]
+    docs = [m for m in media_messages if is_doc_message(m)]
+    total = len(media_messages)
+
+    rows = []
+    filter_row = []
+    if videos:
+        filter_row.append(InlineKeyboardButton(f"🎬 Videos Only ({len(videos)})", callback_data=f"b_dl:{batch_id}:videos"))
+    if docs and videos:
+        filter_row.append(InlineKeyboardButton(f"📁 Videos & Docs ({len(videos) + len(docs)})", callback_data=f"b_dl:{batch_id}:viddoc"))
+    elif docs:
+        filter_row.append(InlineKeyboardButton(f"📄 Docs Only ({len(docs)})", callback_data=f"b_dl:{batch_id}:docs"))
+
+    if filter_row:
+        rows.append(filter_row)
+
+    rows.append([
+        InlineKeyboardButton(f"📥 Download All ({total})", callback_data=f"b_dl:{batch_id}:all"),
+        InlineKeyboardButton("❌ Cancel", callback_data=f"b_dl:{batch_id}:cancel"),
+    ])
+
+    return InlineKeyboardMarkup(rows)
+
+
+async def download_selected_batch(
+    trigger_message: Message,
+    messages: List[Message],
+    status_msg_id: Optional[int] = None,
+):
+    """Sequentially download and deliver selected batch messages."""
+    if status_msg_id:
+        try:
+            await bot.delete_messages(trigger_message.chat.id, [status_msg_id])
+        except Exception:
+            pass
+
+    for idx, m in enumerate(messages):
+        try:
+            await handle_private_message(trigger_message, m)
+        except (asyncio.CancelledError, pyrogram.StopTransmission):
+            break
+        except Exception as e:
+            logger.error(f"Error downloading batch item {idx}: {e}", exc_info=True)
+        if idx < len(messages) - 1:
+            await asyncio.sleep(0.5)
+
+
+@bot.on_callback_query(filters.regex(r"^b_dl:(.+)"))
+async def batch_download_callback_handler(client: Client, callback_query: CallbackQuery):
+    """Handle interactive batch filter clicks (Videos only, Docs & Videos, All, Cancel)."""
+    caller_id = callback_query.from_user.id if callback_query.from_user else None
+    if not is_owner_id(caller_id):
+        await callback_query.answer("⛔ Access Denied.", show_alert=True)
+        return
+
+    cleanup_expired_batches()
+    raw_data = callback_query.data.split("b_dl:", 1)[1]
+    if ":" not in raw_data:
+        await callback_query.answer("⚠️ Invalid request.", show_alert=True)
+        return
+
+    batch_id, filter_type = raw_data.split(":", 1)
+    batch = PENDING_BOT_BATCHES.get(batch_id)
+    if not batch:
+        await callback_query.answer("⚠️ This batch selection has expired or already completed.", show_alert=True)
+        try:
+            await callback_query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    if filter_type == "cancel":
+        PENDING_BOT_BATCHES.pop(batch_id, None)
+        BATCH_MSG_MAP.pop(batch.get("status_msg_id", 0), None)
+        await callback_query.answer("❌ Batch download cancelled.")
+        try:
+            await callback_query.edit_message_text("❌ **Batch download cancelled.**", reply_markup=None)
+        except Exception:
+            pass
+        return
+
+    messages = batch.get("messages", [])
+    if filter_type == "videos":
+        selected = [m for m in messages if is_video_message(m)]
+        label = "video"
+    elif filter_type == "viddoc":
+        selected = [m for m in messages if is_video_message(m) or is_doc_message(m)]
+        label = "video & document"
+    elif filter_type == "docs":
+        selected = [m for m in messages if is_doc_message(m)]
+        label = "document"
+    else:  # all
+        selected = messages
+        label = "media"
+
+    if not selected:
+        await callback_query.answer("⚠️ No files found matching this filter.", show_alert=True)
+        return
+
+    PENDING_BOT_BATCHES.pop(batch_id, None)
+    BATCH_MSG_MAP.pop(batch.get("status_msg_id", 0), None)
+
+    skipped = len(messages) - len(selected)
+    skip_str = f" (skipped {skipped} trash/other items)" if skipped > 0 else ""
+    await callback_query.answer(f"Starting {len(selected)} downloads...")
+    try:
+        await callback_query.edit_message_text(
+            f"⏳ **Starting download of {len(selected)} {label} files from @{batch['bot_username']}...**{skip_str}",
+            reply_markup=None,
+        )
+    except Exception:
+        pass
+
+    asyncio.create_task(download_selected_batch(batch["trigger_message"], selected, batch.get("status_msg_id")))
+
+
 async def handle_bot_start_link(message: Message, bot_username: str, start_param: str):
     """Automatically trigger a bot via deep-link (/start <param>) and fetch the resulting batch media."""
     if acc is None:
@@ -1820,18 +2073,41 @@ async def handle_bot_start_link(message: Message, bot_username: str, start_param
             )
             return
 
+        if len(media_messages) == 1:
+            await bot.edit_message_text(
+                message.chat.id,
+                status_msg.id,
+                f"📦 **Found 1 file from @{bot_username}!**\nStarting download...",
+            )
+            await asyncio.sleep(1.0)
+            await bot.delete_messages(message.chat.id, [status_msg.id])
+            await handle_private_message(message, media_messages[0])
+            return
+
+        # Multiple items: present interactive selection card
+        cleanup_expired_batches()
+        batch_id = uuid.uuid4().hex[:8]
+        PENDING_BOT_BATCHES[batch_id] = {
+            "batch_id": batch_id,
+            "user_id": message.from_user.id if message.from_user else 0,
+            "chat_id": message.chat.id,
+            "bot_username": bot_username,
+            "messages": media_messages,
+            "status_msg_id": status_msg.id,
+            "trigger_message": message,
+            "created_at": time.time(),
+        }
+        BATCH_MSG_MAP[status_msg.id] = batch_id
+
+        preview_text = build_batch_preview_text(bot_username, media_messages)
+        keyboard = build_batch_keyboard(batch_id, media_messages)
+
         await bot.edit_message_text(
             message.chat.id,
             status_msg.id,
-            f"📦 **Found {len(media_messages)} files from @{bot_username}!**\nStarting download & delivery...",
+            preview_text,
+            reply_markup=keyboard,
         )
-        await asyncio.sleep(1.5)
-        await bot.delete_messages(message.chat.id, [status_msg.id])
-
-        for idx, m in enumerate(media_messages):
-            await handle_private_message(message, m)
-            if idx < len(media_messages) - 1:
-                await asyncio.sleep(0.5)
 
     except Exception as e:
         logger.error(f"Error handling bot start link: {e}", exc_info=True)
@@ -1849,24 +2125,37 @@ async def botmedia_handler(client: Client, message: Message):
         await deny_access(message)
         return
 
-    parts = message.text.split(None, 2)
+    parts = message.text.split()
     if len(parts) < 2:
         await bot.send_message(
             message.chat.id,
-            "⚠️ **Usage:** `/botmedia @<bot_username> [count]`\n\n"
+            "⚠️ **Usage:** `/botmedia @<bot_username> [count] [filter]`\n\n"
             "Fetches recent media messages sent to your account by another bot.\n\n"
-            "**Example:**\n`/botmedia @SnipyFileStore_iBot 58`",
+            "**Examples:**\n"
+            "• `/botmedia @SnipyFileStore_iBot 50` _(interactive filter picker)_\n"
+            "• `/botmedia @SnipyFileStore_iBot 50 --video` _(auto-download videos only)_\n"
+            "• `/botmedia @SnipyFileStore_iBot 1-10` _(download items 1 to 10)_",
             reply_to_message_id=message.id,
         )
         return
 
     bot_username = parts[1].strip().lstrip("@")
-    count = 10
-    if len(parts) >= 3:
-        try:
-            count = min(max(int(parts[2].strip()), 1), 100)
-        except ValueError:
-            count = 10
+    count = 20
+    flag = None
+    range_sel = None
+
+    for p in parts[2:]:
+        p_lower = p.lower()
+        if p_lower in ("--video", "--videos", "-v"):
+            flag = "videos"
+        elif p_lower in ("--docs", "--doc", "--documents", "-d"):
+            flag = "docs"
+        elif p_lower in ("--all", "-a"):
+            flag = "all"
+        elif "-" in p and all(s.isdigit() for s in p.split("-", 1)):
+            range_sel = p
+        elif p.isdigit():
+            count = min(max(int(p), 1), 100)
 
     if acc is None:
         await bot.send_message(
@@ -1899,18 +2188,93 @@ async def botmedia_handler(client: Client, message: Message):
             )
             return
 
+        # Direct range filter if provided
+        if range_sel:
+            indices = parse_selection_indices(range_sel, len(media_messages))
+            if indices:
+                selected = [media_messages[i] for i in indices]
+                await bot.edit_message_text(
+                    message.chat.id,
+                    status_msg.id,
+                    f"📦 **Selected {len(selected)} items ({range_sel}) from @{bot_username}!**\nStarting download...",
+                )
+                await asyncio.sleep(1.0)
+                await download_selected_batch(message, selected, status_msg.id)
+                return
+
+        # Direct flag filter if provided
+        if flag == "videos":
+            selected = [m for m in media_messages if is_video_message(m)]
+            if not selected:
+                await bot.edit_message_text(message.chat.id, status_msg.id, "⚠️ No video files found in the scanned messages.")
+                return
+            await bot.edit_message_text(
+                message.chat.id,
+                status_msg.id,
+                f"🎬 **Downloading {len(selected)} videos from @{bot_username}...**",
+            )
+            await asyncio.sleep(1.0)
+            await download_selected_batch(message, selected, status_msg.id)
+            return
+        elif flag == "docs":
+            selected = [m for m in media_messages if is_doc_message(m)]
+            if not selected:
+                await bot.edit_message_text(message.chat.id, status_msg.id, "⚠️ No documents found in the scanned messages.")
+                return
+            await bot.edit_message_text(
+                message.chat.id,
+                status_msg.id,
+                f"📄 **Downloading {len(selected)} documents from @{bot_username}...**",
+            )
+            await asyncio.sleep(1.0)
+            await download_selected_batch(message, selected, status_msg.id)
+            return
+        elif flag == "all":
+            await bot.edit_message_text(
+                message.chat.id,
+                status_msg.id,
+                f"📦 **Downloading all {len(media_messages)} items from @{bot_username}...**",
+            )
+            await asyncio.sleep(1.0)
+            await download_selected_batch(message, media_messages, status_msg.id)
+            return
+
+        # Single item -> direct download
+        if len(media_messages) == 1:
+            await bot.edit_message_text(
+                message.chat.id,
+                status_msg.id,
+                f"📦 **Found 1 media file from @{bot_username}!**\nStarting download...",
+            )
+            await asyncio.sleep(1.0)
+            await bot.delete_messages(message.chat.id, [status_msg.id])
+            await handle_private_message(message, media_messages[0])
+            return
+
+        # Otherwise show interactive picker card
+        cleanup_expired_batches()
+        batch_id = uuid.uuid4().hex[:8]
+        PENDING_BOT_BATCHES[batch_id] = {
+            "batch_id": batch_id,
+            "user_id": message.from_user.id if message.from_user else 0,
+            "chat_id": message.chat.id,
+            "bot_username": bot_username,
+            "messages": media_messages,
+            "status_msg_id": status_msg.id,
+            "trigger_message": message,
+            "created_at": time.time(),
+        }
+        BATCH_MSG_MAP[status_msg.id] = batch_id
+
+        preview_text = build_batch_preview_text(bot_username, media_messages)
+        keyboard = build_batch_keyboard(batch_id, media_messages)
+
         await bot.edit_message_text(
             message.chat.id,
             status_msg.id,
-            f"📦 **Found {len(media_messages)} media files from @{bot_username}!**\nStarting download...",
+            preview_text,
+            reply_markup=keyboard,
         )
-        await asyncio.sleep(1.5)
-        await bot.delete_messages(message.chat.id, [status_msg.id])
-
-        for idx, m in enumerate(media_messages):
-            await handle_private_message(message, m)
-            if idx < len(media_messages) - 1:
-                await asyncio.sleep(0.5)
 
     except Exception as e:
         logger.error(f"Error in /botmedia: {e}", exc_info=True)
@@ -1926,6 +2290,47 @@ async def save(client: Client, message: Message):
     if not is_owner(message):
         await deny_access(message)
         return
+
+    # Check if this message is a reply to an active batch review card
+    if message.reply_to_message and message.reply_to_message.id in BATCH_MSG_MAP:
+        batch_id = BATCH_MSG_MAP.get(message.reply_to_message.id)
+        batch = PENDING_BOT_BATCHES.get(batch_id) if batch_id else None
+        if batch:
+            reply_text = (message.text or "").strip().lower()
+            if reply_text in ("cancel", "stop", "exit", "no"):
+                PENDING_BOT_BATCHES.pop(batch_id, None)
+                BATCH_MSG_MAP.pop(message.reply_to_message.id, None)
+                try:
+                    await bot.edit_message_reply_markup(message.chat.id, batch["status_msg_id"], reply_markup=None)
+                except Exception:
+                    pass
+                await bot.send_message(message.chat.id, "❌ **Batch download cancelled.**", reply_to_message_id=message.id)
+                return
+
+            selected_indices = parse_selection_indices(message.text, len(batch["messages"]))
+            if selected_indices:
+                selected = [batch["messages"][i] for i in selected_indices]
+                PENDING_BOT_BATCHES.pop(batch_id, None)
+                BATCH_MSG_MAP.pop(message.reply_to_message.id, None)
+                try:
+                    await bot.edit_message_reply_markup(message.chat.id, batch["status_msg_id"], reply_markup=None)
+                except Exception:
+                    pass
+
+                status_msg = await bot.send_message(
+                    message.chat.id,
+                    f"⏳ **Downloading {len(selected)} selected files from @{batch['bot_username']}...**",
+                    reply_to_message_id=message.id,
+                )
+                asyncio.create_task(download_selected_batch(message, selected, status_msg.id))
+                return
+            else:
+                await bot.send_message(
+                    message.chat.id,
+                    "⚠️ **Invalid selection.** Please reply with numbers (e.g. `1-5` or `2,4,6`) or tap a filter button.",
+                    reply_to_message_id=message.id,
+                )
+                return
 
     parsed_link = parse_tme_link(message.text)
     if parsed_link is None:
