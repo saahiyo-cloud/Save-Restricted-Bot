@@ -1202,7 +1202,11 @@ def build_guide_text() -> str:
         "Specify `start_id-end_id` in the link:\n"
         "`https://t.me/channelname/100-110`\n"
         "`https://t.me/c/123456789/100-110`\n"
-        "_(Processes up to 100 posts per request)_"
+        "_(Processes up to 100 posts per request)_\n\n"
+        "**5. Bot File Stores & Batches**\n"
+        "Send the bot start link directly:\n"
+        "`https://t.me/botname?start=batch_xyz`\n"
+        "Or use `/botmedia @botname [count]` to fetch recent media!"
     )
 
 
@@ -1218,6 +1222,9 @@ def build_guide_keyboard() -> InlineKeyboardMarkup:
 def build_commands_text() -> str:
     return (
         "⚙️ **Available Commands & Settings**\n\n"
+        "🤖 **Bot File Stores**\n"
+        "• `/botmedia @bot [count]` - Fetch media sent by a bot\n"
+        "• Or send `https://t.me/bot?start=param` link directly\n\n"
         "🖼️ **Thumbnails**\n"
         "• `/setthumb` - Reply to an image to set as thumbnail\n"
         "• `/showthumb` - View your active thumbnail\n"
@@ -1649,6 +1656,12 @@ def parse_tme_link(text: str) -> Optional[Dict[str, Any]]:
         from_id, to_id = parsed_range
         return {"type": "bot", "chatid": target, "from_id": from_id, "to_id": to_id}
 
+    # Bot start deep-link: https://t.me/BOTNAME?start=PARAM
+    match = re.match(r"^https://t\.me/([^/?#\s]+)\?start=([^/\s]+)$", link)
+    if match:
+        bot_username, start_param = match.groups()
+        return {"type": "bot_start", "bot_username": bot_username, "start_param": start_param}
+
     # Public channel with topic/thread: https://t.me/CHANNEL/TOPIC_ID/MSG_RANGE
     match = re.match(r"^https://t\.me/([^/?#\s]+)/[^/?#\s]+/([0-9\s]+(?:-[0-9\s]+)?)(?:\?single)?$", link)
     if match:
@@ -1744,6 +1757,170 @@ async def process_single_message(
                     await bot.send_message(message.chat.id, f"**Error** : __{e}__", reply_to_message_id=message.id)
 
 
+async def handle_bot_start_link(message: Message, bot_username: str, start_param: str):
+    """Automatically trigger a bot via deep-link (/start <param>) and fetch the resulting batch media."""
+    if acc is None:
+        await bot.send_message(
+            message.chat.id,
+            "⚠️ **User Session Required**: To interact with other bots, a user session must be configured.",
+            reply_to_message_id=message.id,
+        )
+        return
+
+    status_msg = await bot.send_message(
+        message.chat.id,
+        f"🤖 **Triggering @{bot_username}...**\nSending `/start {start_param}` to request batch files.",
+        reply_to_message_id=message.id,
+    )
+
+    try:
+        last_id = 0
+        async with acc_lock:
+            try:
+                async for m in acc.get_chat_history(bot_username, limit=1):
+                    last_id = m.id
+                    break
+            except Exception:
+                pass
+
+            sent_cmd = await acc.send_message(bot_username, f"/start {start_param}")
+            if not last_id:
+                last_id = sent_cmd.id
+
+        await bot.edit_message_text(
+            message.chat.id,
+            status_msg.id,
+            f"⏳ **Waiting for @{bot_username} to deliver files...**\nAllowing 8 seconds for batch arrival.",
+        )
+        await asyncio.sleep(8)
+
+        new_messages = []
+        async with acc_lock:
+            async for m in acc.get_chat_history(bot_username, limit=100):
+                if m.id > last_id:
+                    new_messages.append(m)
+
+        new_messages.reverse()
+
+        if not new_messages:
+            await bot.edit_message_text(
+                message.chat.id,
+                status_msg.id,
+                f"⚠️ **No response received from @{bot_username}.**\nThe bot may require force-subscribing to its sponsor channels first, or the link has expired.",
+            )
+            return
+
+        media_messages = [m for m in new_messages if get_message_type(m) not in (None, "Text")]
+        if not media_messages:
+            prompt_text = new_messages[-1].text or new_messages[-1].caption or "No media found."
+            await bot.edit_message_text(
+                message.chat.id,
+                status_msg.id,
+                f"ℹ️ **Message received from @{bot_username}:**\n\n{prompt_text}",
+            )
+            return
+
+        await bot.edit_message_text(
+            message.chat.id,
+            status_msg.id,
+            f"📦 **Found {len(media_messages)} files from @{bot_username}!**\nStarting download & delivery...",
+        )
+        await asyncio.sleep(1.5)
+        await bot.delete_messages(message.chat.id, [status_msg.id])
+
+        for idx, m in enumerate(media_messages):
+            await handle_private_message(message, m)
+            if idx < len(media_messages) - 1:
+                await asyncio.sleep(0.5)
+
+    except Exception as e:
+        logger.error(f"Error handling bot start link: {e}", exc_info=True)
+        await bot.edit_message_text(
+            message.chat.id,
+            status_msg.id,
+            f"❌ **Error interacting with @{bot_username}:** __{e}__",
+        )
+
+
+@bot.on_message(filters.command(["botmedia", "fetchbot", "getbot"]))
+async def botmedia_handler(client: Client, message: Message):
+    """Fetch recent media messages sent by another bot in direct messages."""
+    if not is_owner(message):
+        await deny_access(message)
+        return
+
+    parts = message.text.split(None, 2)
+    if len(parts) < 2:
+        await bot.send_message(
+            message.chat.id,
+            "⚠️ **Usage:** `/botmedia @<bot_username> [count]`\n\n"
+            "Fetches recent media messages sent to your account by another bot.\n\n"
+            "**Example:**\n`/botmedia @SnipyFileStore_iBot 58`",
+            reply_to_message_id=message.id,
+        )
+        return
+
+    bot_username = parts[1].strip().lstrip("@")
+    count = 10
+    if len(parts) >= 3:
+        try:
+            count = min(max(int(parts[2].strip()), 1), 100)
+        except ValueError:
+            count = 10
+
+    if acc is None:
+        await bot.send_message(
+            message.chat.id,
+            "⚠️ **User Session Required**: To fetch files from bot chats, `STRING` must be set.",
+            reply_to_message_id=message.id,
+        )
+        return
+
+    status_msg = await bot.send_message(
+        message.chat.id,
+        f"🔍 **Scanning last {count} messages from @{bot_username}...**",
+        reply_to_message_id=message.id,
+    )
+
+    try:
+        media_messages = []
+        async with acc_lock:
+            async for m in acc.get_chat_history(bot_username, limit=count):
+                if get_message_type(m) not in (None, "Text"):
+                    media_messages.append(m)
+
+        media_messages.reverse()
+
+        if not media_messages:
+            await bot.edit_message_text(
+                message.chat.id,
+                status_msg.id,
+                f"ℹ️ **No media messages found in the last {count} messages with @{bot_username}.**",
+            )
+            return
+
+        await bot.edit_message_text(
+            message.chat.id,
+            status_msg.id,
+            f"📦 **Found {len(media_messages)} media files from @{bot_username}!**\nStarting download...",
+        )
+        await asyncio.sleep(1.5)
+        await bot.delete_messages(message.chat.id, [status_msg.id])
+
+        for idx, m in enumerate(media_messages):
+            await handle_private_message(message, m)
+            if idx < len(media_messages) - 1:
+                await asyncio.sleep(0.5)
+
+    except Exception as e:
+        logger.error(f"Error in /botmedia: {e}", exc_info=True)
+        await bot.edit_message_text(
+            message.chat.id,
+            status_msg.id,
+            f"❌ **Error reading chat with @{bot_username}:** __{e}__",
+        )
+
+
 @bot.on_message(filters.text)
 async def save(client: Client, message: Message):
     if not is_owner(message):
@@ -1757,6 +1934,10 @@ async def save(client: Client, message: Message):
             "⚠️ **Invalid Link**: Please send a valid Telegram post or invite link (e.g. `https://t.me/c/...` or `https://t.me/+...`).",
             reply_to_message_id=message.id,
         )
+        return
+
+    if parsed_link["type"] == "bot_start":
+        await handle_bot_start_link(message, parsed_link["bot_username"], parsed_link["start_param"])
         return
 
     if parsed_link["type"] == "invite":

@@ -64,3 +64,30 @@ async def test_nav_callback_guide_and_back():
             query.answer.assert_called_once()
             query.edit_message_text.assert_called_once()
             assert "Detailed Usage Guide" in query.edit_message_text.call_args[0][0]
+
+
+def test_parse_tme_link_bot_start():
+    from main import parse_tme_link
+    res = parse_tme_link("https://t.me/SnipyFileStore_iBot?start=batch_Z28Ltoo1")
+    assert res is not None
+    assert res["type"] == "bot_start"
+    assert res["bot_username"] == "SnipyFileStore_iBot"
+    assert res["start_param"] == "batch_Z28Ltoo1"
+
+
+@pytest.mark.asyncio
+async def test_botmedia_handler_help_text():
+    from main import botmedia_handler
+    owner_id = list(owner_ids)[0] if owner_ids else 12345
+    with patch("main.owner_ids", {owner_id}):
+        user_msg = MagicMock()
+        user_msg.chat.id = 1001
+        user_msg.id = 2001
+        user_msg.text = "/botmedia"
+        user_msg.from_user.id = owner_id
+
+        with patch("main.bot.send_message", new_callable=AsyncMock) as mock_send:
+            await botmedia_handler(MagicMock(), user_msg)
+            mock_send.assert_called_once()
+            assert "Usage:" in mock_send.call_args[0][1]
+
