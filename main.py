@@ -1847,6 +1847,155 @@ def parse_selection_indices(text: str, max_count: int) -> List[int]:
     return sorted(list(indices))
 
 
+FALLBACK_THUMB_PATH = "downloads/thumbnails/placeholder.jpg"
+
+
+def get_or_create_placeholder_thumb() -> str:
+    """Ensure a fallback thumbnail exists on disk for media items without previews."""
+    if os.path.exists(FALLBACK_THUMB_PATH) and os.path.getsize(FALLBACK_THUMB_PATH) > 0:
+        return FALLBACK_THUMB_PATH
+    try:
+        from PIL import Image, ImageDraw
+        os.makedirs("downloads/thumbnails", exist_ok=True)
+        img = Image.new("RGB", (400, 300), color=(30, 35, 45))
+        d = ImageDraw.Draw(img)
+        d.rectangle([(10, 10), (390, 290)], outline=(60, 70, 90), width=3)
+        img.save(FALLBACK_THUMB_PATH, "JPEG")
+        return FALLBACK_THUMB_PATH
+    except Exception:
+        return ""
+
+
+def remove_batch_thumbs(batch_id: str):
+    """Clean up cached thumbnail images for a given batch."""
+    try:
+        for f in Path("downloads/thumbnails").glob(f"batch_{batch_id}_*"):
+            try:
+                f.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def cleanup_expired_batches():
+    """Remove batch selection states older than 30 minutes and clean cached thumbnails."""
+    now = time.time()
+    expired = [k for k, v in list(PENDING_BOT_BATCHES.items()) if now - v.get("created_at", 0) > 1800]
+    for k in expired:
+        batch = PENDING_BOT_BATCHES.pop(k, None)
+        if batch:
+            if "status_msg_id" in batch:
+                BATCH_MSG_MAP.pop(batch["status_msg_id"], None)
+            remove_batch_thumbs(k)
+
+
+async def get_message_preview_thumb(msg: Message, batch_id: str, index: int) -> str:
+    """Retrieve or download a thumbnail for the given Telegram message."""
+    cache_path = os.path.join("downloads", "thumbnails", f"batch_{batch_id}_{index}.jpg")
+    if os.path.exists(cache_path) and os.path.getsize(cache_path) > 0:
+        return cache_path
+
+    if acc is not None:
+        try:
+            if getattr(msg, "photo", None):
+                thumb = await acc.download_media(msg.photo.file_id, file_name=cache_path)
+                if thumb and os.path.exists(thumb):
+                    return thumb
+            elif getattr(msg, "video", None) and getattr(msg.video, "thumbs", None):
+                thumb = await acc.download_media(msg.video.thumbs[0].file_id, file_name=cache_path)
+                if thumb and os.path.exists(thumb):
+                    return thumb
+            elif getattr(msg, "document", None) and getattr(msg.document, "thumbs", None):
+                thumb = await acc.download_media(msg.document.thumbs[0].file_id, file_name=cache_path)
+                if thumb and os.path.exists(thumb):
+                    return thumb
+        except Exception as e:
+            logger.warning(f"Could not download preview thumb for msg {msg.id}: {e}")
+
+    return get_or_create_placeholder_thumb()
+
+
+def build_slider_caption(bot_username: str, media_messages: List[Message], index: int) -> str:
+    """Build rich itemized preview caption including size, file/msg id, and batch counts."""
+    total = len(media_messages)
+    m = media_messages[index]
+    name, size, m_type = extract_media_info(m)
+    icon = get_media_item_icon(m)
+
+    is_ad = is_photo_message(m)
+    ad_tag = " ⚠️ **[Banner / Ad]**" if is_ad else ""
+
+    caption_snippet = ""
+    if getattr(m, "caption", None):
+        clean_cap = m.caption.strip()
+        if len(clean_cap) > 75:
+            clean_cap = clean_cap[:72] + "..."
+        caption_snippet = f"\n💬 **Caption:** __{clean_cap}__"
+
+    videos_cnt = sum(1 for x in media_messages if is_video_message(x))
+    docs_cnt = sum(1 for x in media_messages if is_doc_message(x))
+    photos_cnt = sum(1 for x in media_messages if is_photo_message(x))
+
+    return (
+        f"📦 **Batch Preview: [ {index + 1} / {total} ]** • @{bot_username}\n\n"
+        f"{icon} **File:** `{name}`{ad_tag}\n"
+        f"💾 **Size:** `{format_size(size)}`\n"
+        f"🆔 **File / Msg ID:** `{m.id}`\n"
+        f"🏷️ **Type:** `{m_type}`"
+        f"{caption_snippet}\n\n"
+        f"📊 **Batch Total ({total}):** 🎬 {videos_cnt} Videos • 📄 {docs_cnt} Docs • 🖼️ {photos_cnt} Ads\n\n"
+        f"👉 _Navigate below or reply with range (e.g. `1-5` or `3,4,8`)._"
+    )
+
+
+def build_slider_keyboard(batch_id: str, media_messages: List[Message], current_index: int) -> InlineKeyboardMarkup:
+    """Build inline slider keyboard with Next/Prev navigation, download current, and batch filters."""
+    total = len(media_messages)
+    videos = [m for m in media_messages if is_video_message(m)]
+    docs = [m for m in media_messages if is_doc_message(m)]
+
+    # Row 1: Carousel navigation [ ⬅️ Prev ] [ index / total ] [ Next ➡️ ]
+    prev_btn = (
+        InlineKeyboardButton("⬅️ Prev", callback_data=f"b_slide:{batch_id}:{current_index - 1}")
+        if current_index > 0
+        else InlineKeyboardButton("⏮️ First", callback_data="b_noop")
+    )
+    counter_btn = InlineKeyboardButton(f"{current_index + 1} / {total}", callback_data="b_noop")
+    next_btn = (
+        InlineKeyboardButton("Next ➡️", callback_data=f"b_slide:{batch_id}:{current_index + 1}")
+        if current_index < total - 1
+        else InlineKeyboardButton("⏭️ Last", callback_data="b_noop")
+    )
+    nav_row = [prev_btn, counter_btn, next_btn]
+
+    # Row 2: Download the currently viewed file
+    download_current_row = [
+        InlineKeyboardButton(f"📥 Download This File (#{current_index + 1})", callback_data=f"b_dl_single:{batch_id}:{current_index}")
+    ]
+
+    # Row 3: Batch filter buttons
+    filter_row = []
+    if videos:
+        filter_row.append(InlineKeyboardButton(f"🎬 Download Videos ({len(videos)})", callback_data=f"b_dl:{batch_id}:videos"))
+    if docs and videos:
+        filter_row.append(InlineKeyboardButton(f"📁 Videos & Docs ({len(videos) + len(docs)})", callback_data=f"b_dl:{batch_id}:viddoc"))
+    elif docs:
+        filter_row.append(InlineKeyboardButton(f"📄 Docs Only ({len(docs)})", callback_data=f"b_dl:{batch_id}:docs"))
+
+    rows = [nav_row, download_current_row]
+    if filter_row:
+        rows.append(filter_row)
+
+    # Row 4: Download All and Cancel
+    rows.append([
+        InlineKeyboardButton(f"📥 Download All ({total})", callback_data=f"b_dl:{batch_id}:all"),
+        InlineKeyboardButton("❌ Cancel", callback_data=f"b_dl:{batch_id}:cancel"),
+    ])
+
+    return InlineKeyboardMarkup(rows)
+
+
 def build_batch_preview_text(bot_username: str, media_messages: List[Message], max_preview: int = 6) -> str:
     """Generate an itemized breakdown and preview of incoming bot media."""
     videos = [m for m in media_messages if is_video_message(m)]
@@ -1941,6 +2090,111 @@ async def download_selected_batch(
             await asyncio.sleep(0.5)
 
 
+@bot.on_callback_query(filters.regex(r"^b_noop$"))
+async def batch_noop_callback_handler(client: Client, callback_query: CallbackQuery):
+    """Handle counter button click (no-op)."""
+    await callback_query.answer()
+
+
+@bot.on_callback_query(filters.regex(r"^b_slide:(.+)"))
+async def batch_slider_callback_handler(client: Client, callback_query: CallbackQuery):
+    """Handle carousel slide navigation (Prev / Next)."""
+    caller_id = callback_query.from_user.id if callback_query.from_user else None
+    if not is_owner_id(caller_id):
+        await callback_query.answer("⛔ Access Denied.", show_alert=True)
+        return
+
+    cleanup_expired_batches()
+    raw_data = callback_query.data.split("b_slide:", 1)[1]
+    if ":" not in raw_data:
+        await callback_query.answer()
+        return
+
+    batch_id, idx_str = raw_data.split(":", 1)
+    batch = PENDING_BOT_BATCHES.get(batch_id)
+    if not batch:
+        await callback_query.answer("⚠️ This batch preview has expired.", show_alert=True)
+        return
+
+    try:
+        new_index = int(idx_str)
+    except ValueError:
+        await callback_query.answer()
+        return
+
+    messages = batch.get("messages", [])
+    if not (0 <= new_index < len(messages)):
+        await callback_query.answer()
+        return
+
+    batch["current_index"] = new_index
+    await callback_query.answer()
+
+    thumb = await get_message_preview_thumb(messages[new_index], batch_id, new_index)
+    caption = build_slider_caption(batch["bot_username"], messages, new_index)
+    keyboard = build_slider_keyboard(batch_id, messages, new_index)
+
+    if thumb and os.path.exists(thumb):
+        try:
+            await callback_query.edit_message_media(
+                InputMediaPhoto(thumb, caption=caption),
+                reply_markup=keyboard,
+            )
+            return
+        except MessageNotModified:
+            return
+        except Exception as e:
+            logger.warning(f"Failed to edit message media in slider: {e}")
+
+    try:
+        await callback_query.edit_message_caption(caption=caption, reply_markup=keyboard)
+    except MessageNotModified:
+        pass
+    except Exception:
+        try:
+            await callback_query.edit_message_text(caption, reply_markup=keyboard)
+        except Exception:
+            pass
+
+
+@bot.on_callback_query(filters.regex(r"^b_dl_single:(.+)"))
+async def batch_download_single_callback_handler(client: Client, callback_query: CallbackQuery):
+    """Handle downloading the currently viewed file in the slider."""
+    caller_id = callback_query.from_user.id if callback_query.from_user else None
+    if not is_owner_id(caller_id):
+        await callback_query.answer("⛔ Access Denied.", show_alert=True)
+        return
+
+    cleanup_expired_batches()
+    raw_data = callback_query.data.split("b_dl_single:", 1)[1]
+    if ":" not in raw_data:
+        await callback_query.answer()
+        return
+
+    batch_id, idx_str = raw_data.split(":", 1)
+    batch = PENDING_BOT_BATCHES.get(batch_id)
+    if not batch:
+        await callback_query.answer("⚠️ This batch preview has expired.", show_alert=True)
+        return
+
+    try:
+        index = int(idx_str)
+    except ValueError:
+        await callback_query.answer()
+        return
+
+    messages = batch.get("messages", [])
+    if not (0 <= index < len(messages)):
+        await callback_query.answer("⚠️ Invalid item index.", show_alert=True)
+        return
+
+    target_msg = messages[index]
+    name, _, _ = extract_media_info(target_msg)
+    await callback_query.answer(f"📥 Starting download: {name[:25]}...")
+
+    asyncio.create_task(download_selected_batch(batch["trigger_message"], [target_msg], None))
+
+
 @bot.on_callback_query(filters.regex(r"^b_dl:(.+)"))
 async def batch_download_callback_handler(client: Client, callback_query: CallbackQuery):
     """Handle interactive batch filter clicks (Videos only, Docs & Videos, All, Cancel)."""
@@ -1968,11 +2222,15 @@ async def batch_download_callback_handler(client: Client, callback_query: Callba
     if filter_type == "cancel":
         PENDING_BOT_BATCHES.pop(batch_id, None)
         BATCH_MSG_MAP.pop(batch.get("status_msg_id", 0), None)
-        await callback_query.answer("❌ Batch download cancelled.")
+        remove_batch_thumbs(batch_id)
+        await callback_query.answer("❌ Batch cancelled.")
         try:
-            await callback_query.edit_message_text("❌ **Batch download cancelled.**", reply_markup=None)
+            await callback_query.edit_message_caption(caption="❌ **Batch download cancelled.**", reply_markup=None)
         except Exception:
-            pass
+            try:
+                await callback_query.edit_message_text("❌ **Batch download cancelled.**", reply_markup=None)
+            except Exception:
+                pass
         return
 
     messages = batch.get("messages", [])
@@ -1995,19 +2253,21 @@ async def batch_download_callback_handler(client: Client, callback_query: Callba
 
     PENDING_BOT_BATCHES.pop(batch_id, None)
     BATCH_MSG_MAP.pop(batch.get("status_msg_id", 0), None)
+    remove_batch_thumbs(batch_id)
 
     skipped = len(messages) - len(selected)
-    skip_str = f" (skipped {skipped} trash/other items)" if skipped > 0 else ""
+    skip_str = f" (skipped {skipped} ads/other items)" if skipped > 0 else ""
     await callback_query.answer(f"Starting {len(selected)} downloads...")
+    status_text = f"⏳ **Downloading {len(selected)} {label} files from @{batch['bot_username']}...**{skip_str}"
     try:
-        await callback_query.edit_message_text(
-            f"⏳ **Starting download of {len(selected)} {label} files from @{batch['bot_username']}...**{skip_str}",
-            reply_markup=None,
-        )
+        await callback_query.edit_message_caption(caption=status_text, reply_markup=None)
     except Exception:
-        pass
+        try:
+            await callback_query.edit_message_text(status_text, reply_markup=None)
+        except Exception:
+            pass
 
-    asyncio.create_task(download_selected_batch(batch["trigger_message"], selected, batch.get("status_msg_id")))
+    asyncio.create_task(download_selected_batch(batch["trigger_message"], selected, None))
 
 
 async def handle_bot_start_link(message: Message, bot_username: str, start_param: str):
@@ -2043,15 +2303,48 @@ async def handle_bot_start_link(message: Message, bot_username: str, start_param
         await bot.edit_message_text(
             message.chat.id,
             status_msg.id,
-            f"⏳ **Waiting for @{bot_username} to deliver files...**\nAllowing 8 seconds for batch arrival.",
+            f"⏳ **Waiting for @{bot_username} to deliver batch files...**",
         )
-        await asyncio.sleep(8)
 
+        # Adaptive listener: polls until no new messages arrive for 2 consecutive cycles (4s)
+        # or max timeout (60s) is reached. This ensures ALL files (50+ items) are captured!
+        start_wait = time.time()
+        max_wait = 60.0
+        last_count = 0
+        idle_streak = 0
         new_messages = []
-        async with acc_lock:
-            async for m in acc.get_chat_history(bot_username, limit=100):
-                if m.id > last_id:
-                    new_messages.append(m)
+
+        while time.time() - start_wait < max_wait:
+            await asyncio.sleep(2.0)
+            collected = []
+            async with acc_lock:
+                async for m in acc.get_chat_history(bot_username, limit=200):
+                    if m.id > last_id:
+                        collected.append(m)
+                    else:
+                        break
+
+            curr_count = len(collected)
+            if curr_count > last_count:
+                last_count = curr_count
+                idle_streak = 0
+                media_cnt = sum(1 for m in collected if get_message_type(m) not in (None, "Text"))
+                try:
+                    await bot.edit_message_text(
+                        message.chat.id,
+                        status_msg.id,
+                        f"⏳ **Receiving batch from @{bot_username}...**\nFetched **{media_cnt}** files so far, waiting for remaining items...",
+                    )
+                except Exception:
+                    pass
+            elif curr_count > 0:
+                idle_streak += 1
+                if idle_streak >= 2:  # No new messages in 4 seconds -> all delivered!
+                    new_messages = collected
+                    break
+
+        if not new_messages and collected:
+            new_messages = collected
 
         new_messages.reverse()
 
@@ -2059,7 +2352,7 @@ async def handle_bot_start_link(message: Message, bot_username: str, start_param
             await bot.edit_message_text(
                 message.chat.id,
                 status_msg.id,
-                f"⚠️ **No response received from @{bot_username}.**\nThe bot may require force-subscribing to its sponsor channels first, or the link has expired.",
+                f"⚠️ **No response received from @{bot_username}.**\nThe bot may require subscribing to sponsor channels first, or the link has expired.",
             )
             return
 
@@ -2084,30 +2377,55 @@ async def handle_bot_start_link(message: Message, bot_username: str, start_param
             await handle_private_message(message, media_messages[0])
             return
 
-        # Multiple items: present interactive selection card
+        # Multiple items: present interactive image preview slider
         cleanup_expired_batches()
         batch_id = uuid.uuid4().hex[:8]
+
         PENDING_BOT_BATCHES[batch_id] = {
             "batch_id": batch_id,
             "user_id": message.from_user.id if message.from_user else 0,
             "chat_id": message.chat.id,
             "bot_username": bot_username,
             "messages": media_messages,
-            "status_msg_id": status_msg.id,
+            "status_msg_id": 0,
             "trigger_message": message,
+            "current_index": 0,
             "created_at": time.time(),
         }
-        BATCH_MSG_MAP[status_msg.id] = batch_id
 
-        preview_text = build_batch_preview_text(bot_username, media_messages)
-        keyboard = build_batch_keyboard(batch_id, media_messages)
+        thumb = await get_message_preview_thumb(media_messages[0], batch_id, 0)
+        caption = build_slider_caption(bot_username, media_messages, 0)
+        keyboard = build_slider_keyboard(batch_id, media_messages, 0)
 
-        await bot.edit_message_text(
-            message.chat.id,
-            status_msg.id,
-            preview_text,
-            reply_markup=keyboard,
-        )
+        slider_msg = None
+        if thumb and os.path.exists(thumb):
+            try:
+                slider_msg = await bot.send_photo(
+                    message.chat.id,
+                    photo=thumb,
+                    caption=caption,
+                    reply_markup=keyboard,
+                    reply_to_message_id=message.id,
+                )
+                try:
+                    await bot.delete_messages(message.chat.id, [status_msg.id])
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(f"Could not send photo preview slider: {e}")
+
+        if not slider_msg:
+            # Fallback to text if photo failed
+            await bot.edit_message_text(
+                message.chat.id,
+                status_msg.id,
+                caption,
+                reply_markup=keyboard,
+            )
+            slider_msg = status_msg
+
+        PENDING_BOT_BATCHES[batch_id]["status_msg_id"] = slider_msg.id
+        BATCH_MSG_MAP[slider_msg.id] = batch_id
 
     except Exception as e:
         logger.error(f"Error handling bot start link: {e}", exc_info=True)
@@ -2132,8 +2450,8 @@ async def botmedia_handler(client: Client, message: Message):
             "⚠️ **Usage:** `/botmedia @<bot_username> [count] [filter]`\n\n"
             "Fetches recent media messages sent to your account by another bot.\n\n"
             "**Examples:**\n"
-            "• `/botmedia @SnipyFileStore_iBot 50` _(interactive filter picker)_\n"
-            "• `/botmedia @SnipyFileStore_iBot 50 --video` _(auto-download videos only)_\n"
+            "• `/botmedia @SnipyFileStore_iBot 60` _(interactive preview slider)_\n"
+            "• `/botmedia @SnipyFileStore_iBot 60 --video` _(auto-download videos only)_\n"
             "• `/botmedia @SnipyFileStore_iBot 1-10` _(download items 1 to 10)_",
             reply_to_message_id=message.id,
         )
@@ -2155,7 +2473,7 @@ async def botmedia_handler(client: Client, message: Message):
         elif "-" in p and all(s.isdigit() for s in p.split("-", 1)):
             range_sel = p
         elif p.isdigit():
-            count = min(max(int(p), 1), 100)
+            count = min(max(int(p), 1), 200)
 
     if acc is None:
         await bot.send_message(
@@ -2251,30 +2569,54 @@ async def botmedia_handler(client: Client, message: Message):
             await handle_private_message(message, media_messages[0])
             return
 
-        # Otherwise show interactive picker card
+        # Multiple items -> present interactive image preview slider
         cleanup_expired_batches()
         batch_id = uuid.uuid4().hex[:8]
+
         PENDING_BOT_BATCHES[batch_id] = {
             "batch_id": batch_id,
             "user_id": message.from_user.id if message.from_user else 0,
             "chat_id": message.chat.id,
             "bot_username": bot_username,
             "messages": media_messages,
-            "status_msg_id": status_msg.id,
+            "status_msg_id": 0,
             "trigger_message": message,
+            "current_index": 0,
             "created_at": time.time(),
         }
-        BATCH_MSG_MAP[status_msg.id] = batch_id
 
-        preview_text = build_batch_preview_text(bot_username, media_messages)
-        keyboard = build_batch_keyboard(batch_id, media_messages)
+        thumb = await get_message_preview_thumb(media_messages[0], batch_id, 0)
+        caption = build_slider_caption(bot_username, media_messages, 0)
+        keyboard = build_slider_keyboard(batch_id, media_messages, 0)
 
-        await bot.edit_message_text(
-            message.chat.id,
-            status_msg.id,
-            preview_text,
-            reply_markup=keyboard,
-        )
+        slider_msg = None
+        if thumb and os.path.exists(thumb):
+            try:
+                slider_msg = await bot.send_photo(
+                    message.chat.id,
+                    photo=thumb,
+                    caption=caption,
+                    reply_markup=keyboard,
+                    reply_to_message_id=message.id,
+                )
+                try:
+                    await bot.delete_messages(message.chat.id, [status_msg.id])
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(f"Could not send photo preview slider: {e}")
+
+        if not slider_msg:
+            await bot.edit_message_text(
+                message.chat.id,
+                status_msg.id,
+                caption,
+                reply_markup=keyboard,
+            )
+            slider_msg = status_msg
+
+        PENDING_BOT_BATCHES[batch_id]["status_msg_id"] = slider_msg.id
+        BATCH_MSG_MAP[slider_msg.id] = batch_id
 
     except Exception as e:
         logger.error(f"Error in /botmedia: {e}", exc_info=True)

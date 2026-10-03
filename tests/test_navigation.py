@@ -223,7 +223,7 @@ async def test_batch_download_callback_handler_filter_videos():
         assert batch_id not in PENDING_BOT_BATCHES
         assert 999 not in BATCH_MSG_MAP
         # download_selected_batch is called with only the video message (photo excluded!)
-        mock_download.assert_called_once_with(trigger_msg, [m_vid], 999)
+        mock_download.assert_called_once_with(trigger_msg, [m_vid], None)
 
 
 @pytest.mark.asyncio
@@ -270,6 +270,135 @@ async def test_save_reply_to_batch_range():
             assert batch_id not in PENDING_BOT_BATCHES
             assert 888 not in BATCH_MSG_MAP
             mock_download.assert_called_once_with(reply_msg, [m2, m3], 9999)
+
+
+def test_build_slider_caption_and_keyboard():
+    from main import build_slider_caption, build_slider_keyboard
+
+    m1 = MagicMock()
+    m1.id = 5551
+    m1.video = MagicMock()
+    m1.document = None
+    m1.photo = None
+    m1.caption = "Episode 1 in 1080p"
+    m1.video.file_name = "Ep1.mp4"
+    m1.video.file_size = 50 * 1024 * 1024
+
+    m2 = MagicMock()
+    m2.id = 5552
+    m2.video = None
+    m2.document = None
+    m2.photo = MagicMock()
+    m2.caption = "Join our sponsor"
+
+    messages = [m1, m2]
+
+    caption0 = build_slider_caption("SnipyBot", messages, 0)
+    assert "[ 1 / 2 ]" in caption0
+    assert "Ep1.mp4" in caption0
+    assert "5551" in caption0
+    assert "50.00 MB" in caption0
+    assert "Video" in caption0
+    assert "Episode 1 in 1080p" in caption0
+
+    caption1 = build_slider_caption("SnipyBot", messages, 1)
+    assert "[ 2 / 2 ]" in caption1
+    assert "Banner / Ad" in caption1
+    assert "5552" in caption1
+
+    kb0 = build_slider_keyboard("batch99", messages, 0)
+    btns0 = [b.text for r in kb0.inline_keyboard for b in r]
+    assert any("1 / 2" in t for t in btns0)
+    assert any("Next ➡️" in t for t in btns0)
+    assert any("Download This File (#1)" in t for t in btns0)
+    assert any("Download Videos (1)" in t for t in btns0)
+
+
+@pytest.mark.asyncio
+async def test_batch_slider_callback_handler_slide_next():
+    import time
+    from main import batch_slider_callback_handler, PENDING_BOT_BATCHES
+    owner_id = list(owner_ids)[0] if owner_ids else 12345
+
+    m1 = MagicMock(id=101, video=MagicMock(), document=None, photo=None, caption=None)
+    m1.video.file_name = "vid1.mp4"
+    m1.video.file_size = 1000
+    m1.video.thumbs = None
+
+    m2 = MagicMock(id=102, video=MagicMock(), document=None, photo=None, caption=None)
+    m2.video.file_name = "vid2.mp4"
+    m2.video.file_size = 2000
+    m2.video.thumbs = None
+
+    batch_id = "slide_b1"
+    PENDING_BOT_BATCHES[batch_id] = {
+        "batch_id": batch_id,
+        "user_id": owner_id,
+        "chat_id": 1001,
+        "bot_username": "SnipyBot",
+        "messages": [m1, m2],
+        "status_msg_id": 777,
+        "trigger_message": MagicMock(),
+        "current_index": 0,
+        "created_at": time.time(),
+    }
+
+    query = MagicMock()
+    query.data = f"b_slide:{batch_id}:1"
+    query.from_user.id = owner_id
+    query.answer = AsyncMock()
+    query.edit_message_media = AsyncMock()
+
+    await batch_slider_callback_handler(MagicMock(), query)
+
+    query.answer.assert_called_once()
+    assert PENDING_BOT_BATCHES[batch_id]["current_index"] == 1
+    query.edit_message_media.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_batch_download_single_callback_handler():
+    import time
+    from main import batch_download_single_callback_handler, PENDING_BOT_BATCHES
+    owner_id = list(owner_ids)[0] if owner_ids else 12345
+
+    m1 = MagicMock(id=201, video=MagicMock(), document=None, photo=None, caption=None)
+    m1.video.file_name = "video1.mp4"
+    m1.video.file_size = 1000
+
+    m2 = MagicMock(id=202, video=MagicMock(), document=None, photo=None, caption=None)
+    m2.video.file_name = "video2.mp4"
+    m2.video.file_size = 2000
+
+    trigger_msg = MagicMock()
+    batch_id = "single_b1"
+    PENDING_BOT_BATCHES[batch_id] = {
+        "batch_id": batch_id,
+        "user_id": owner_id,
+        "chat_id": 1001,
+        "bot_username": "SnipyBot",
+        "messages": [m1, m2],
+        "status_msg_id": 666,
+        "trigger_message": trigger_msg,
+        "current_index": 1,
+        "created_at": time.time(),
+    }
+
+    query = MagicMock()
+    query.data = f"b_dl_single:{batch_id}:1"
+    query.from_user.id = owner_id
+    query.answer = AsyncMock()
+
+    with patch("main.download_selected_batch", new_callable=AsyncMock) as mock_download:
+        await batch_download_single_callback_handler(MagicMock(), query)
+
+        query.answer.assert_called_once()
+        assert "Starting download" in query.answer.call_args[0][0]
+        # Downloaded item 1 (m2) specifically
+        mock_download.assert_called_once_with(trigger_msg, [m2], None)
+        # Batch should still remain in pending for user to continue browsing!
+        assert batch_id in PENDING_BOT_BATCHES
+
 
 
 
