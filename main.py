@@ -420,6 +420,77 @@ def del_user_custom_msg(user_id: int) -> bool:
     return False
 
 
+# ==========================================
+# Self-Destruct / Auto-Delete Media Settings
+# ==========================================
+
+AUTODELETE_DIR = Path("downloads/autodelete")
+AUTODELETE_DIR.mkdir(parents=True, exist_ok=True)
+DEFAULT_AUTODELETE_SECONDS = 900  # 15 minutes default
+
+
+def get_user_autodelete_delay(user_id: int) -> int:
+    """Retrieve user's autodelete delay in seconds. Defaults to 900s (15 min). Returns 0 if disabled."""
+    target = AUTODELETE_DIR / f"{user_id}.txt"
+    if target.exists():
+        try:
+            val = int(target.read_text(encoding="utf-8").strip())
+            return max(0, val)
+        except Exception:
+            pass
+    return DEFAULT_AUTODELETE_SECONDS
+
+
+def set_user_autodelete_delay(user_id: int, seconds: int):
+    """Save user's autodelete delay in seconds. 0 disables auto-delete."""
+    target = AUTODELETE_DIR / f"{user_id}.txt"
+    target.write_text(str(max(0, int(seconds))), encoding="utf-8")
+
+
+def del_user_autodelete_delay(user_id: int) -> bool:
+    """Reset user's autodelete setting back to default (15 minutes)."""
+    target = AUTODELETE_DIR / f"{user_id}.txt"
+    if target.exists():
+        try:
+            target.unlink()
+            return True
+        except Exception:
+            pass
+    return False
+
+
+def format_autodelete_note(seconds: int) -> str:
+    """Format the self-destruct advisory note for messages."""
+    if seconds <= 0:
+        return ""
+    time_str = get_readable_time(seconds)
+    return f"\n\n⏳ **Self-Destruct Notice:** This media will be automatically deleted in **{time_str}** for privacy."
+
+
+async def schedule_media_deletion(chat_id: int, message_ids: Union[int, List[int]], delay_seconds: int):
+    """Schedule background deletion of sent media messages after delay_seconds."""
+    if delay_seconds <= 0:
+        return
+    if isinstance(message_ids, int):
+        ids_to_delete = [message_ids]
+    else:
+        ids_to_delete = [m for m in message_ids if m]
+
+    if not ids_to_delete:
+        return
+
+    async def _delayed_purge():
+        try:
+            await asyncio.sleep(delay_seconds)
+            await bot.delete_messages(chat_id, ids_to_delete)
+            logger.info(f"Auto-deleted {len(ids_to_delete)} messages in chat {chat_id} after {delay_seconds}s.")
+        except Exception as e:
+            logger.debug(f"Could not auto-delete messages {ids_to_delete} in chat {chat_id}: {e}")
+
+    return asyncio.create_task(_delayed_purge())
+
+
+
 def format_time_duration(seconds: float) -> str:
     """Format elapsed seconds into readable human string."""
     if seconds < 1.0:
@@ -439,6 +510,7 @@ def build_completion_message(
     upload_duration: float,
     bot_username: Optional[str] = None,
     custom_note: Optional[str] = None,
+    autodelete_note: Optional[str] = None,
 ) -> str:
     """Build a detailed completion report card with download and upload statistics."""
     size_str = format_size(file_size) if file_size > 0 else "Unknown"
@@ -459,6 +531,7 @@ def build_completion_message(
 
     via_str = f"\n🤖 **Downloaded via:** @{bot_username}" if bot_username else ""
     note_str = f"\n\n💬 **Note:** {custom_note}" if custom_note else ""
+    autodel_str = autodelete_note if autodelete_note else ""
 
     return (
         "✅ **Download Completed!**\n\n"
@@ -469,6 +542,7 @@ def build_completion_message(
         f"🚀 **Upload Time:** `{up_str}`{up_speed_str}\n"
         f"⏳ **Total Time:** `{total_str}`"
         f"{note_str}"
+        f"{autodel_str}"
         f"{via_str}"
     )
 
@@ -483,7 +557,8 @@ async def send_completion_report(
     thumb_path: Optional[str] = None,
     user_id: Optional[int] = None,
     reply_to_message_id: Optional[int] = None,
-):
+    autodelete_note: Optional[str] = None,
+) -> Optional[Message]:
     """Send a separate message detailing file transfer statistics as a clean text card (no thumbnail attached on completion)."""
     bot_username = getattr(getattr(bot, "me", None), "username", None)
     custom_note = get_user_custom_msg(user_id) if user_id else None
@@ -495,22 +570,25 @@ async def send_completion_report(
         upload_duration=upload_duration,
         bot_username=bot_username,
         custom_note=custom_note,
+        autodelete_note=autodelete_note,
     )
 
+    sent = None
     try:
-        await bot.send_message(
+        sent = await bot.send_message(
             chat_id=chat_id,
             text=text,
             reply_to_message_id=reply_to_message_id,
         )
     except Exception:
         try:
-            await bot.send_message(
+            sent = await bot.send_message(
                 chat_id=chat_id,
                 text=text,
             )
         except Exception as e:
             logger.warning(f"Could not send completion report: {e}")
+    return sent
 
 
 def check_file_size_limit(msg: Message) -> Tuple[bool, int]:
@@ -1242,6 +1320,9 @@ def build_commands_text() -> str:
         "• `/setmsg <text>` - Custom note on completion cards\n"
         "• `/showmsg` - View active completion note\n"
         "• `/delmsg` - Remove completion note\n\n"
+        "⏳ **Auto-Delete (Self-Destruct)**\n"
+        "• `/setautodel <duration>` - Set self-destruct timer (e.g. `15m`, `30m`, `1h` or `off`)\n"
+        "• `/showautodel` - View active self-destruct duration\n\n"
         "📊 **Diagnostics & Help**\n"
         "• `/ping` - Test network response latency\n"
         "• `/stats` or `/status` - Bot diagnostics, RAM & CPU\n"
@@ -1617,6 +1698,100 @@ async def showmsg_handler(client: Client, message: Message):
         await bot.send_message(message.chat.id, "ℹ️ **No custom completion message note set.**", reply_to_message_id=message.id)
 
 
+@bot.on_message(filters.command(["setautodel", "autodelete"]))
+async def setautodel_handler(client: Client, message: Message):
+    if not is_owner(message):
+        await deny_access(message)
+        return
+    parts = message.text.split(None, 1)
+    user_id = message.from_user.id if message.from_user else 0
+    if len(parts) < 2:
+        current_delay = get_user_autodelete_delay(user_id)
+        current_str = get_readable_time(current_delay) if current_delay > 0 else "Disabled"
+        await bot.send_message(
+            message.chat.id,
+            "⏳ **Auto-Delete (Self-Destruct) Settings**\n\n"
+            f"Current Timer: **{current_str}**\n\n"
+            "**Usage:** `/setautodel <duration>`\n\n"
+            "**Examples:**\n"
+            "• `/setautodel 15m` - Auto-delete loaded media after 15 minutes (default)\n"
+            "• `/setautodel 30m` - Auto-delete after 30 minutes\n"
+            "• `/setautodel 1h` - Auto-delete after 1 hour\n"
+            "• `/setautodel 0` or `/setautodel off` - Disable auto-delete",
+            reply_to_message_id=message.id,
+        )
+        return
+
+    arg = parts[1].strip().lower()
+    if arg in ("0", "off", "disable", "none"):
+        set_user_autodelete_delay(user_id, 0)
+        await bot.send_message(
+            message.chat.id,
+            "🛑 **Auto-delete disabled.** Loaded media will not be automatically deleted.",
+            reply_to_message_id=message.id,
+        )
+        return
+
+    # Parse duration like 15m, 900s, 1h, 15
+    match = re.match(r"^(\d+)\s*([smhd]?)$", arg)
+    if not match:
+        await bot.send_message(
+            message.chat.id,
+            "⚠️ **Invalid duration format.** Use numbers like `15m`, `30m`, `1h`, or `900s`.",
+            reply_to_message_id=message.id,
+        )
+        return
+
+    amount, unit = match.groups()
+    amount = int(amount)
+    multiplier = 60  # Default unit is minutes
+    if unit == "s":
+        multiplier = 1
+    elif unit == "m":
+        multiplier = 60
+    elif unit == "h":
+        multiplier = 3600
+    elif unit == "d":
+        multiplier = 86400
+
+    total_seconds = amount * multiplier
+    if total_seconds < 10:
+        await bot.send_message(
+            message.chat.id,
+            "⚠️ Minimum auto-delete timer is 10 seconds.",
+            reply_to_message_id=message.id,
+        )
+        return
+
+    set_user_autodelete_delay(user_id, total_seconds)
+    await bot.send_message(
+        message.chat.id,
+        f"✅ **Auto-delete timer set to {get_readable_time(total_seconds)}!**\nLoaded media and completion summaries will self-destruct after this time.",
+        reply_to_message_id=message.id,
+    )
+
+
+@bot.on_message(filters.command(["showautodel"]))
+async def showautodel_handler(client: Client, message: Message):
+    if not is_owner(message):
+        await deny_access(message)
+        return
+    user_id = message.from_user.id if message.from_user else 0
+    current_delay = get_user_autodelete_delay(user_id)
+    if current_delay > 0:
+        await bot.send_message(
+            message.chat.id,
+            f"⏳ **Active Auto-Delete Timer:** **{get_readable_time(current_delay)}**",
+            reply_to_message_id=message.id,
+        )
+    else:
+        await bot.send_message(
+            message.chat.id,
+            "ℹ️ **Auto-Delete is currently disabled.**",
+            reply_to_message_id=message.id,
+        )
+
+
 async def send_with_user_session(message: Message, chatid: Union[int, str], msgid: int, processed_media_groups: set):
     if acc is None:
         await bot.send_message(message.chat.id, f"**String Session is not Set**", reply_to_message_id=message.id)
@@ -1740,17 +1915,31 @@ async def process_single_message(
                     # Message is empty/deleted via bot API; fall back to user session
                     await send_with_user_session(message, chatid, msgid, processed_media_groups)
                     return
+                user_id = message.from_user.id if message.from_user else 0
+                autodel_delay = get_user_autodelete_delay(user_id)
+                copied_res = None
                 if getattr(msg, "media_group_id", None):
                     media_group_key = (msg.chat.id, msg.media_group_id)
                     if media_group_key in processed_media_groups:
                         return
                     try:
-                        await bot.copy_media_group(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
+                        copied_res = await bot.copy_media_group(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
                         processed_media_groups.add(media_group_key)
                     except ValueError:
-                        await bot.copy_message(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
+                        copied_res = await bot.copy_message(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
                 else:
-                    await bot.copy_message(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
+                    copied_res = await bot.copy_message(message.chat.id, msg.chat.id, msg.id, reply_to_message_id=message.id)
+
+                if copied_res and autodel_delay > 0:
+                    del_ids = [m.id for m in copied_res] if isinstance(copied_res, list) else [copied_res.id]
+                    # Send self-destruct notice and schedule cleanup
+                    note_text = f"⏳ **Self-Destruct Notice:** Media above will be automatically deleted in **{get_readable_time(autodel_delay)}**."
+                    try:
+                        notice_msg = await bot.send_message(message.chat.id, note_text, reply_to_message_id=del_ids[0])
+                        del_ids.append(notice_msg.id)
+                    except Exception:
+                        pass
+                    await schedule_media_deletion(message.chat.id, del_ids, autodel_delay)
             except (asyncio.CancelledError, pyrogram.StopTransmission):
                 return
             except Exception:
@@ -2781,14 +2970,27 @@ async def save_media(client: Client, message: Message):
         return
 
     try:
+        user_id = message.from_user.id if message.from_user else 0
+        autodel_delay = get_user_autodelete_delay(user_id)
+        copied_res = None
         if message.media_group_id:
             await asyncio.sleep(1)
             media_group = await bot.get_media_group(message.chat.id, message.id)
             if message.id != media_group[0].id:
                 return
-            await bot.copy_media_group(message.chat.id, message.chat.id, message.id, reply_to_message_id=message.id)
+            copied_res = await bot.copy_media_group(message.chat.id, message.chat.id, message.id, reply_to_message_id=message.id)
         else:
-            await bot.copy_message(message.chat.id, message.chat.id, message.id, reply_to_message_id=message.id)
+            copied_res = await bot.copy_message(message.chat.id, message.chat.id, message.id, reply_to_message_id=message.id)
+
+        if copied_res and autodel_delay > 0:
+            del_ids = [m.id for m in copied_res] if isinstance(copied_res, list) else [copied_res.id]
+            note_text = f"⏳ **Self-Destruct Notice:** Media above will be automatically deleted in **{get_readable_time(autodel_delay)}**."
+            try:
+                notice_msg = await bot.send_message(message.chat.id, note_text, reply_to_message_id=del_ids[0])
+                del_ids.append(notice_msg.id)
+            except Exception:
+                pass
+            await schedule_media_deletion(message.chat.id, del_ids, autodel_delay)
     except Exception as e:
         await bot.send_message(message.chat.id, f"**Error** : __{e}__", reply_to_message_id=message.id)
 
@@ -3136,7 +3338,10 @@ async def handle_private_message(message: Message, msg: Message):
             report_thumb = file
 
         report_reply_id = sent_media.id if sent_media else message.id
-        await send_completion_report(
+        autodel_delay = get_user_autodelete_delay(user_id)
+        autodel_note = format_autodelete_note(autodel_delay)
+
+        completion_msg = await send_completion_report(
             chat_id=message.chat.id,
             file_name=file_display_name,
             file_size=file_size,
@@ -3146,7 +3351,17 @@ async def handle_private_message(message: Message, msg: Message):
             thumb_path=report_thumb,
             user_id=user_id,
             reply_to_message_id=report_reply_id,
+            autodelete_note=autodel_note,
         )
+
+        if autodel_delay > 0:
+            media_ids_to_del = []
+            if sent_media:
+                media_ids_to_del.append(sent_media.id)
+            if completion_msg:
+                media_ids_to_del.append(completion_msg.id)
+            if media_ids_to_del:
+                await schedule_media_deletion(message.chat.id, media_ids_to_del, autodel_delay)
 
     except (asyncio.CancelledError, pyrogram.StopTransmission):
         logger.info(f"Task {task_id} was cancelled cleanly.")
@@ -3327,12 +3542,15 @@ async def handle_private_media_group(message: Message, messages: List[Message]):
         await bot.edit_message_text(message.chat.id, smsg.id, initial_up_text, reply_markup=cancel_markup)
 
         upload_start = time.time()
+        sent_group_ids = []
         # Send media in chunks of MAX_MEDIA_GROUP_SIZE to respect Telegram's 10-item limit
         for i in range(0, len(media), MAX_MEDIA_GROUP_SIZE):
             if task_ctx.is_cancelled:
                 return
             chunk = media[i:i + MAX_MEDIA_GROUP_SIZE]
-            await bot.send_media_group(message.chat.id, chunk, reply_to_message_id=message.id)
+            res_chunk = await bot.send_media_group(message.chat.id, chunk, reply_to_message_id=message.id)
+            if res_chunk:
+                sent_group_ids.extend([m.id for m in res_chunk])
         upload_duration = max(time.time() - upload_start, 0.01)
 
         # Delete status message
@@ -3347,7 +3565,10 @@ async def handle_private_media_group(message: Message, messages: List[Message]):
                     report_thumb = f
                     break
 
-        await send_completion_report(
+        autodel_delay = get_user_autodelete_delay(user_id)
+        autodel_note = format_autodelete_note(autodel_delay)
+
+        completion_msg = await send_completion_report(
             chat_id=message.chat.id,
             file_name=f"Media Album ({len(files)} items)",
             file_size=total_size,
@@ -3357,7 +3578,14 @@ async def handle_private_media_group(message: Message, messages: List[Message]):
             thumb_path=report_thumb,
             user_id=user_id,
             reply_to_message_id=message.id,
+            autodelete_note=autodel_note,
         )
+
+        if autodel_delay > 0:
+            if completion_msg:
+                sent_group_ids.append(completion_msg.id)
+            if sent_group_ids:
+                await schedule_media_deletion(message.chat.id, sent_group_ids, autodel_delay)
 
     except (asyncio.CancelledError, pyrogram.StopTransmission):
         logger.info(f"Media group task {task_id} was cancelled cleanly.")

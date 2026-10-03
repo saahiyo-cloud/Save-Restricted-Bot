@@ -13,6 +13,7 @@
 - **Modern Transfer Progress UI**: Real-time progress bar dashboard with download speed, ETA, elapsed time, and thumbnail preview during transfer.
 - **Completion Summary Cards**: Separate clean cards detailing completed file transfers, file sizes, and download/upload elapsed duration.
 - **Custom Thumbnails & Captions**: Personalize your uploaded documents and videos with custom thumbnails and caption templates (`{filename}`, `{caption}`).
+- **Self-Destruct / Auto-Delete Media**: Automatically deletes delivered media messages and completion cards after a customizable timer (defaults to **15 minutes**) with an advisory notice to preserve chat privacy and storage.
 - **Anti-Ban Protections**: Intelligent batch pacing, rate-limit backoffs, and invite-link cooldowns to protect user sessions from FloodWait.
 - **System Diagnostics**: Built-in `/ping`, `/stats`, and `/status` monitoring CPU, RAM, disk, active tasks, and session health.
 
@@ -174,6 +175,8 @@ https://t.me/c/123456789/101-120
 | `/setcaption <template>` | Set custom caption template (supports `{filename}` and `{caption}`) |
 | `/delcaption` | Delete your custom caption template |
 | `/showcaption` | View your active custom caption template |
+| `/setautodel <time>` | Configure self-destruct timer for loaded media (e.g. `15m`, `30m`, `1h`, or `off`) |
+| `/showautodel` | View your active self-destruct timer (defaults to 15 minutes) |
 | `/cancel` | Cancel an ongoing batch download in progress |
 
 ---

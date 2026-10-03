@@ -323,3 +323,49 @@ async def test_send_completion_report_fallback_text():
         mock_send_msg.assert_called_once()
         assert "document.pdf" in mock_send_msg.call_args[1]["text"]
         assert "Download Time:" in mock_send_msg.call_args[1]["text"]
+
+
+def test_autodelete_settings_lifecycle():
+    from main import (
+        get_user_autodelete_delay,
+        set_user_autodelete_delay,
+        del_user_autodelete_delay,
+        format_autodelete_note,
+        DEFAULT_AUTODELETE_SECONDS,
+    )
+    user_id = 88776655
+    del_user_autodelete_delay(user_id)
+
+    # Defaults to 15 minutes (900 seconds)
+    assert get_user_autodelete_delay(user_id) == DEFAULT_AUTODELETE_SECONDS
+    note = format_autodelete_note(900)
+    assert "Self-Destruct Notice:" in note
+    assert "15m" in note
+
+    # Change to 30 minutes (1800s)
+    set_user_autodelete_delay(user_id, 1800)
+    assert get_user_autodelete_delay(user_id) == 1800
+    assert "30m" in format_autodelete_note(1800)
+
+    # Disable auto-delete (0s)
+    set_user_autodelete_delay(user_id, 0)
+    assert get_user_autodelete_delay(user_id) == 0
+    assert format_autodelete_note(0) == ""
+
+    # Reset
+    assert del_user_autodelete_delay(user_id) is True
+    assert get_user_autodelete_delay(user_id) == DEFAULT_AUTODELETE_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_schedule_media_deletion_task():
+    from main import schedule_media_deletion
+
+    with patch("main.bot.delete_messages", new_callable=AsyncMock) as mock_del:
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            task = await schedule_media_deletion(chat_id=12345, message_ids=[101, 102], delay_seconds=900)
+            assert task is not None
+            await task
+            mock_sleep.assert_called_with(900)
+            mock_del.assert_called_with(12345, [101, 102])
+
