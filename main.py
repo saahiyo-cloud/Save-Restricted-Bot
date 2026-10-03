@@ -1146,12 +1146,195 @@ async def cancel_callback_handler(client: Client, callback_query: CallbackQuery)
         pass
 
 
+def is_owner_id(user_id: Optional[int]) -> bool:
+    return user_id is not None and user_id in owner_ids
+
+
 def is_owner(message: Message) -> bool:
-    return message.from_user is not None and message.from_user.id in owner_ids
+    return message.from_user is not None and is_owner_id(message.from_user.id)
+
+
+def build_start_text(mention: str) -> str:
+    return (
+        f"👋 **Hi {mention}**, I'm **Save Restricted Bot**!\n\n"
+        "I can help you save and download restricted content from Telegram posts and channels.\n\n"
+        "⚡ **Quick Formats:**\n"
+        "• **Public Post:** `https://t.me/channel/123`\n"
+        "• **Batch Range:** `https://t.me/channel/10-25`\n"
+        "• **Private Post:** Send join invite `https://t.me/+abc` first\n\n"
+        "💡 _Use the buttons below or /help for complete guide & settings._"
+    )
+
+
+def build_start_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📖 Full Guide", callback_data="nav_guide"),
+            InlineKeyboardButton("⚙️ Commands", callback_data="nav_commands"),
+        ],
+        [
+            InlineKeyboardButton("📊 Bot Status", callback_data="nav_stats"),
+            InlineKeyboardButton("🏓 Ping", callback_data="nav_ping"),
+        ]
+    ])
+
+
+def build_guide_text() -> str:
+    return (
+        "📖 **Detailed Usage Guide**\n\n"
+        "**1. Public Channels & Groups**\n"
+        "Send any normal post link directly:\n"
+        "`https://t.me/channelname/123`\n\n"
+        "**2. Private Channels / Restricted Posts**\n"
+        "• If the bot's user session has not joined yet, send the invite link first:\n"
+        "  `https://t.me/+invite_code`\n"
+        "• Once joined, send the restricted post link:\n"
+        "  `https://t.me/c/123456789/123`\n\n"
+        "**3. Topics & Forum Channels**\n"
+        "`https://t.me/channelname/45/123`\n"
+        "`https://t.me/c/123456789/45/123`\n\n"
+        "**4. Multiple Posts / Batch Download**\n"
+        "Specify `start_id-end_id` in the link:\n"
+        "`https://t.me/channelname/100-110`\n"
+        "`https://t.me/c/123456789/100-110`\n"
+        "_(Processes up to 100 posts per request)_"
+    )
+
+
+def build_guide_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⚙️ Commands", callback_data="nav_commands"),
+            InlineKeyboardButton("🔙 Back to Start", callback_data="nav_start"),
+        ]
+    ])
+
+
+def build_commands_text() -> str:
+    return (
+        "⚙️ **Available Commands & Settings**\n\n"
+        "🖼️ **Thumbnails**\n"
+        "• `/setthumb` - Reply to an image to set as thumbnail\n"
+        "• `/showthumb` - View your active thumbnail\n"
+        "• `/delthumb` - Remove custom thumbnail\n\n"
+        "📝 **Captions**\n"
+        "• `/setcaption <template>` - Variables: `{caption}`, `{filename}`\n"
+        "• `/showcaption` - View active template\n"
+        "• `/delcaption` - Reset to original post caption\n\n"
+        "💬 **Completion Notes**\n"
+        "• `/setmsg <text>` - Custom note on completion cards\n"
+        "• `/showmsg` - View active completion note\n"
+        "• `/delmsg` - Remove completion note\n\n"
+        "📊 **Diagnostics & Help**\n"
+        "• `/ping` - Test network response latency\n"
+        "• `/stats` or `/status` - Bot diagnostics, RAM & CPU\n"
+        "• `/help` - View complete user guide"
+    )
+
+
+def build_commands_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📖 Full Guide", callback_data="nav_guide"),
+            InlineKeyboardButton("🔙 Back to Start", callback_data="nav_start"),
+        ]
+    ])
+
+
+def build_stats_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🔄 Refresh Stats", callback_data="nav_stats"),
+            InlineKeyboardButton("🔙 Back to Start", callback_data="nav_start"),
+        ]
+    ])
+
+
+def build_ping_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🏓 Ping Again", callback_data="nav_ping"),
+            InlineKeyboardButton("🔙 Back to Start", callback_data="nav_start"),
+        ]
+    ])
+
+
+def format_stats_text(stats: Dict[str, Any]) -> str:
+    return (
+        "📊 **Bot Diagnostics & System Stats**\n\n"
+        f"⏱️ **Uptime:** `{stats['uptime']}`\n"
+        f"🔄 **Active Tasks:** `{stats['active_tasks']}`\n"
+        f"🧠 **Memory:** `{stats['memory']}`\n"
+        f"⚡ **CPU Usage:** `{stats['cpu']}`\n"
+        f"💾 **Disk Space:** `{stats['disk']}`\n"
+        f"👤 **User Session:** `{stats['user_session']}`\n"
+        f"🐍 **Python:** `v{stats['python_version']}` | **Pyrogram:** `v{stats['pyrogram_version']}`"
+    )
 
 
 async def deny_access(message: Message):
     await bot.send_message(message.chat.id, "**You are not authorized to use this bot.**", reply_to_message_id=message.id)
+
+
+@bot.on_callback_query(filters.regex(r"^nav_(.+)"))
+async def nav_callback_handler(client: Client, callback_query: CallbackQuery):
+    caller_id = callback_query.from_user.id if callback_query.from_user else None
+    if not is_owner_id(caller_id):
+        await callback_query.answer("⛔ Access Denied.", show_alert=True)
+        return
+
+    data = callback_query.data or ""
+    action = data.split("nav_", 1)[1] if "nav_" in data else ""
+    mention = callback_query.from_user.mention if callback_query.from_user else "User"
+
+    if action == "start":
+        await callback_query.answer()
+        try:
+            await callback_query.edit_message_text(
+                build_start_text(mention),
+                reply_markup=build_start_keyboard(),
+            )
+        except MessageNotModified:
+            pass
+    elif action == "guide":
+        await callback_query.answer()
+        try:
+            await callback_query.edit_message_text(
+                build_guide_text(),
+                reply_markup=build_guide_keyboard(),
+            )
+        except MessageNotModified:
+            pass
+    elif action == "commands":
+        await callback_query.answer()
+        try:
+            await callback_query.edit_message_text(
+                build_commands_text(),
+                reply_markup=build_commands_keyboard(),
+            )
+        except MessageNotModified:
+            pass
+    elif action == "stats":
+        await callback_query.answer("Refreshing stats...")
+        stats = get_system_stats()
+        try:
+            await callback_query.edit_message_text(
+                format_stats_text(stats),
+                reply_markup=build_stats_keyboard(),
+            )
+        except MessageNotModified:
+            pass
+    elif action == "ping":
+        start_t = time.time()
+        await callback_query.answer("Pinging...")
+        latency = (time.time() - start_t) * 1000.0
+        try:
+            await callback_query.edit_message_text(
+                f"🏓 **Pong!**\n📶 **Latency:** `{latency:.2f} ms`",
+                reply_markup=build_ping_keyboard(),
+            )
+        except MessageNotModified:
+            pass
 
 
 @bot.on_message(filters.command(["start"]))
@@ -1159,10 +1342,25 @@ async def send_start(client: Client, message: Message):
     if not is_owner(message):
         await deny_access(message)
         return
+    mention = message.from_user.mention if message.from_user else "User"
     await bot.send_message(
         message.chat.id,
-        f"__👋 Hi **{message.from_user.mention}**, I am Save Restricted Bot, I can send you restricted content by it's post link__\n\n{USAGE}",
+        build_start_text(mention),
         reply_to_message_id=message.id,
+        reply_markup=build_start_keyboard(),
+    )
+
+
+@bot.on_message(filters.command(["help"]))
+async def help_handler(client: Client, message: Message):
+    if not is_owner(message):
+        await deny_access(message)
+        return
+    await bot.send_message(
+        message.chat.id,
+        build_guide_text(),
+        reply_to_message_id=message.id,
+        reply_markup=build_guide_keyboard(),
     )
 
 
@@ -1228,6 +1426,7 @@ async def ping_handler(client: Client, message: Message):
         message.chat.id,
         reply.id,
         f"🏓 **Pong!**\n📶 **Latency:** `{latency_ms:.2f} ms`",
+        reply_markup=build_ping_keyboard(),
     )
 
 
@@ -1247,7 +1446,7 @@ async def stats_handler(client: Client, message: Message):
         f"👤 **User Session:** `{stats['user_session']}`\n"
         f"🐍 **Python:** `v{stats['python_version']}` | **Pyrogram:** `v{stats['pyrogram_version']}`"
     )
-    await bot.send_message(message.chat.id, text, reply_to_message_id=message.id)
+    await bot.send_message(message.chat.id, text, reply_to_message_id=message.id, reply_markup=build_stats_keyboard())
 
 
 @bot.on_message(filters.command(["setthumb"]))
@@ -1540,30 +1739,58 @@ async def save(client: Client, message: Message):
 
     parsed_link = parse_tme_link(message.text)
     if parsed_link is None:
-        await bot.send_message(message.chat.id, "**Invalid Link**", reply_to_message_id=message.id)
+        await bot.send_message(
+            message.chat.id,
+            "⚠️ **Invalid Link**: Please send a valid Telegram post or invite link (e.g. `https://t.me/c/...` or `https://t.me/+...`).",
+            reply_to_message_id=message.id,
+        )
         return
 
     if parsed_link["type"] == "invite":
         if acc is None:
-            await bot.send_message(message.chat.id, "**String Session is not Set**", reply_to_message_id=message.id)
+            await bot.send_message(
+                message.chat.id,
+                "⚠️ **User Session Required**: To join private channels, a valid `STRING` session must be configured.",
+                reply_to_message_id=message.id,
+            )
             return
 
         try:
             async with acc_lock:
                 await acc.join_chat(parsed_link["link"])
-            await bot.send_message(message.chat.id, "**Chat Joined**", reply_to_message_id=message.id)
+            await bot.send_message(
+                message.chat.id,
+                "✅ **Joined Chat**: Successfully joined! You can now send post links from this channel.",
+                reply_to_message_id=message.id,
+            )
         except UserAlreadyParticipant:
-            await bot.send_message(message.chat.id, "**Chat already Joined**", reply_to_message_id=message.id)
+            await bot.send_message(
+                message.chat.id,
+                "ℹ️ **Already Joined**: You are already a member of this chat. Ready to fetch posts!",
+                reply_to_message_id=message.id,
+            )
         except InviteHashExpired:
-            await bot.send_message(message.chat.id, "**Invalid Link**", reply_to_message_id=message.id)
+            await bot.send_message(
+                message.chat.id,
+                "❌ **Expired Invite**: This invite link has expired or is invalid.",
+                reply_to_message_id=message.id,
+            )
         except Exception as e:
-            await bot.send_message(message.chat.id, f"**Error** : __{e}__", reply_to_message_id=message.id)
+            await bot.send_message(
+                message.chat.id,
+                f"❌ **Error joining chat**: __{e}__",
+                reply_to_message_id=message.id,
+            )
         return
 
     from_id = parsed_link["from_id"]
     to_id = parsed_link["to_id"]
     if to_id < from_id:
-        await bot.send_message(message.chat.id, "**Invalid Range**", reply_to_message_id=message.id)
+        await bot.send_message(
+            message.chat.id,
+            "⚠️ **Invalid Range**: The end message ID must be greater than or equal to start message ID.",
+            reply_to_message_id=message.id,
+        )
         return
     if to_id - from_id + 1 > MAX_MESSAGE_RANGE:
         await bot.send_message(
@@ -2217,81 +2444,7 @@ def get_message_type(msg: Message) -> Optional[str]:
     return None
 
 
-USAGE = """**How to use**
-
-Send a Telegram message link and the bot will send the content back to you.
-
-**Public channels / groups**
-
-Send a normal post link:
-
-```
-https://t.me/channelname/123
-```
-
-**Private channels / groups / restricted content**
-
-If the user session has not joined the target chat yet, send the invite link first:
-
-```
-https://t.me/+invite_code
-```
-
-Then send the post link:
-
-```
-https://t.me/c/123456789/123
-```
-
-These links require a valid `STRING`.
-
-**Bot chat messages**
-
-Use the `/b/` format:
-
-```
-https://t.me/b/botusername/4321
-```
-
-These links also require a valid `STRING`.
-
-**Forum / topic messages**
-
-Use the topic format:
-
-```
-https://t.me/channelname/45/123
-
-https://t.me/c/123456789/45/123
-```
-
-**Multiple messages**
-
-Use `start_id-end_id` in the message ID position:
-
-```
-https://t.me/channelname/1001-1010
-
-https://t.me/c/123456789/101-120
-```
-
-The bot processes up to 100 messages per request. Albums / media groups are sent as a group when possible.
-
-**Custom Thumbnails, Captions & Completion Messages**
-- `/setthumb`: Reply to any image to set as your default thumbnail
-- `/delthumb`: Delete your custom thumbnail
-- `/showthumb`: View your current active thumbnail
-- `/setcaption <template>`: Set custom caption with `{caption}` and `{filename}`
-- `/delcaption`: Remove custom caption template
-- `/showcaption`: View active caption template
-- `/setmsg <text>`: Add a custom note/branding to download completion cards
-- `/delmsg`: Remove custom note from completion cards
-- `/showmsg`: View active completion note
-
-**Diagnostics & Info**
-- `/ping`: Check bot response latency
-- `/stats` or `/status`: View bot uptime, CPU, RAM, disk space, and active tasks
-"""
+USAGE = build_guide_text()
 
 
 async def main():
